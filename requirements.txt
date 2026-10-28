@@ -1,1 +1,3 @@
 pytest>=8,<10
+alpaca-py
+python-dotenv

@@ -12,4 +12,22 @@ pytest
 python -m app.main
 ```
 
-The demo uses synthetic sample data, not current market prices. Next steps: add an authenticated market-data adapter, point-in-time universe selection, historical backtesting with transaction costs, and a paper-only broker adapter.
+The demo uses synthetic sample data, not current market prices.
+
+## Market-data scan
+
+`python -m app.main --scan` fetches real daily bars and latest quotes via the
+Alpaca market-data API and ranks the default universe (NVDA, TSLA, GME, AMC,
+AAPL, MSFT). Pass tickers to override: `python -m app.main --scan AMD INTC`.
+
+The scan is **read-only** — it places no orders. It uses only completed daily
+candles (today's bar is excluded until after the 16:00 ET close) and prints each
+symbol's score alongside its latest market-data timestamp. Symbols with
+insufficient bars or no usable quote are reported with a reason instead of a
+score.
+
+Credentials come from `.env` (see `.env.example`): `ALPACA_API_KEY`,
+`ALPACA_SECRET_KEY`, and optionally `ALPACA_DATA_FEED` (`iex` for free plans,
+`sip` for paid).
+
+Next steps: point-in-time universe selection, historical backtesting with transaction costs, and a paper-only broker adapter.
