@@ -30,9 +30,18 @@ def main() -> None:
         metavar="TICKER",
         help="fetch real daily bars and rank tickers (defaults to the built-in universe)",
     )
+    parser.add_argument("--backtest", action="store_true", help="run a read-only historical simulation")
     args = parser.parse_args()
 
-    if args.scan is None:
+    if args.backtest:
+        if args.scan is not None:
+            parser.error("--scan and --backtest cannot be combined")
+        from app.backtest import fetch_history, run_backtest, backtest_report
+        from app.market_data import DEFAULT_SYMBOLS
+
+        history = fetch_history(DEFAULT_SYMBOLS + ["SPY"])
+        print(backtest_report(run_backtest(history)))
+    elif args.scan is None:
         run_demo()
     else:
         from app.market_data import DEFAULT_SYMBOLS
