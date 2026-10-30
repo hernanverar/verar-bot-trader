@@ -1,5 +1,9 @@
 # Universe Discovery Assessment — Phase 2A.1
 
+> **Status (Phase 2A.2):** implemented — `app/market_discovery.py` uses
+> `get_market_movers` (gainers) + `get_most_actives` (volume) with a flagged
+> curated fallback, exposed via `GET /api/scanner/hot-stocks?mode=auto`.
+
 Can we automatically discover top-gaining and high-volume U.S. stocks
 instead of scanning the hardcoded 6-symbol universe?
 

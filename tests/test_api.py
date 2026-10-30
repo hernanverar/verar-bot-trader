@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.api.main import app
 from app.backtest import BacktestResult
+from app.market_discovery import DiscoveryResult
 from app.strategies.hot_stock_scanner import HotStock
 
 
@@ -117,7 +118,7 @@ def test_hot_stocks_endpoint():
     with patch(
         "app.api.main.scan_hot_stocks", return_value=[stock, filtered]
     ) as scan:
-        response = client.get("/api/scanner/hot-stocks")
+        response = client.get("/api/scanner/hot-stocks?mode=manual")
 
     assert response.status_code == 200
     data = response.json()
@@ -125,6 +126,7 @@ def test_hot_stocks_endpoint():
     assert len(data["results"]) == 2
     assert data["total_scanned"] == 2
     assert data["eligible_count"] == 1
+    assert data["discovery_mode"] == "manual"
     assert data["universe"] == ["NVDA", "TSLA", "GME", "AMC", "AAPL", "MSFT"]
 
     row = data["results"][0]
@@ -159,6 +161,8 @@ def test_hot_stocks_passes_symbols_and_config():
     assert args[0] == ["NVDA", "TSLA"]
     assert kwargs["config"].min_rvol == 1.5
     assert response.json()["results"] == []
+    # Explicit symbols imply manual mode for backward compatibility.
+    assert response.json()["discovery_mode"] == "manual"
 
 
 def test_hot_stocks_rejects_invalid_symbols():
@@ -167,3 +171,112 @@ def test_hot_stocks_rejects_invalid_symbols():
 
     response = client.get("/api/scanner/hot-stocks?top=0")
     assert response.status_code == 422
+
+
+def test_hot_stocks_auto_mode_discovers_universe():
+    discovered = DiscoveryResult(
+        symbols=("MARA", "RIOT"),
+        source="screener:movers+actives",
+        as_of=datetime(2026, 1, 15, 15, 30, tzinfo=timezone.utc),
+        is_fallback=False,
+        warning=None,
+    )
+    with (
+        patch("app.api.main.get_trading_client", return_value=object()),
+        patch(
+            "app.api.main.discover_momentum_universe",
+            return_value=discovered,
+        ) as discover,
+        patch("app.api.main.scan_hot_stocks", return_value=[]) as scan,
+    ):
+        response = client.get("/api/scanner/hot-stocks?mode=auto")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["discovery_mode"] == "auto"
+    assert data["discovery_source"] == "screener:movers+actives"
+    assert data["discovery_as_of"] == "2026-01-15T15:30:00+00:00"
+    assert data["is_fallback"] is False
+    assert data["discovery_warning"] is None
+    assert data["universe"] == ["MARA", "RIOT"]
+
+    discover.assert_called_once()
+    scan.assert_called_once()
+    assert scan.call_args[0][0] == ["MARA", "RIOT"]
+
+
+def test_hot_stocks_auto_fallback_is_reported():
+    discovered = DiscoveryResult(
+        symbols=("NVDA", "TSLA"),
+        source="fallback_curated",
+        as_of=datetime(2026, 1, 15, 15, 30, tzinfo=timezone.utc),
+        is_fallback=True,
+        warning="Screener discovery unavailable; NOT market-wide discovery.",
+    )
+    with (
+        patch("app.api.main.get_trading_client", return_value=object()),
+        patch(
+            "app.api.main.discover_momentum_universe",
+            return_value=discovered,
+        ),
+        patch("app.api.main.scan_hot_stocks", return_value=[]),
+    ):
+        response = client.get("/api/scanner/hot-stocks?mode=auto")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["is_fallback"] is True
+    assert data["discovery_source"] == "fallback_curated"
+    assert "NOT market-wide" in data["discovery_warning"]
+
+
+def test_hot_stocks_rejects_unknown_mode():
+    response = client.get("/api/scanner/hot-stocks?mode=wat")
+    assert response.status_code == 422
+
+
+def test_auto_mode_accepts_alpaca_symbol_formats():
+    """Regression: discovered tickers like BRK.B must not trip the
+    manual-input 'Invalid symbols list' validation."""
+    discovered = DiscoveryResult(
+        symbols=("BRK.B", "MARA"),
+        source="screener:movers",
+        as_of=datetime(2026, 1, 15, 15, 30, tzinfo=timezone.utc),
+        is_fallback=False,
+        warning=None,
+    )
+    with (
+        patch("app.api.main.get_trading_client", return_value=object()),
+        patch("app.api.main.discover_momentum_universe", return_value=discovered),
+        patch("app.api.main.scan_hot_stocks", return_value=[]) as scan,
+    ):
+        response = client.get("/api/scanner/hot-stocks?mode=auto")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["universe"] == ["BRK.B", "MARA"]
+    scan.assert_called_once()
+    assert scan.call_args[0][0] == ["BRK.B", "MARA"]
+
+
+def test_auto_empty_discovery_is_not_a_422():
+    discovered = DiscoveryResult(
+        symbols=(),
+        source="screener:movers",
+        as_of=datetime(2026, 1, 15, 15, 30, tzinfo=timezone.utc),
+        is_fallback=False,
+        warning=None,
+    )
+    with (
+        patch("app.api.main.get_trading_client", return_value=object()),
+        patch("app.api.main.discover_momentum_universe", return_value=discovered),
+        patch("app.api.main.scan_hot_stocks", return_value=[]) as scan,
+    ):
+        response = client.get("/api/scanner/hot-stocks?mode=auto")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["universe"] == []
+    assert data["results"] == []
+    assert data["discovery_warning"]
+    scan.assert_not_called()

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from app.backtest import fetch_history, run_backtest
 from app.market_data import DEFAULT_SYMBOLS
+from app.market_discovery import discover_momentum_universe, get_trading_client
 from app.strategies.hot_stock_scanner import ScannerConfig, scan_hot_stocks
 
 app = FastAPI(
@@ -51,21 +52,57 @@ def execute_backtest(request: BacktestRequest):
 
 @app.get("/api/scanner/hot-stocks")
 def hot_stocks(
+    mode: str = Query(default="auto", pattern="^(auto|manual)$"),
     symbols: str | None = None,
     top: int = Query(default=20, ge=1, le=100),
     min_rvol: float | None = Query(default=None, ge=0),
     min_change_pct: float | None = Query(default=None),
 ):
-    """Rank intraday hot stocks. Read-only market data; never places orders."""
-    if symbols:
-        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    else:
-        symbol_list = list(DEFAULT_SYMBOLS)
+    """Rank intraday hot stocks. Read-only market data; never places orders.
 
-    if not symbol_list or len(symbol_list) > 50 or any(
-        not s.isalnum() or len(s) > 10 for s in symbol_list
-    ):
-        raise HTTPException(status_code=422, detail="Invalid symbols list")
+    mode=auto discovers the universe via Alpaca's screener (with an
+    explicitly-flagged curated fallback). mode=manual or an explicit
+    `symbols` list preserves the original scanner behavior.
+    """
+    discovery_mode = "manual" if symbols else mode
+    discovery_source = "manual"
+    discovery_as_of = None
+    discovery_warning = None
+    is_fallback = False
+
+    if discovery_mode == "auto":
+        try:
+            trading_client = get_trading_client()
+        except RuntimeError:
+            trading_client = None
+        try:
+            discovery = discover_momentum_universe(trading_client=trading_client)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        symbol_list = list(discovery.symbols)
+        discovery_source = discovery.source
+        discovery_as_of = (
+            discovery.as_of.isoformat() if discovery.as_of else None
+        )
+        discovery_warning = discovery.warning
+        is_fallback = discovery.is_fallback
+        if not symbol_list:
+            discovery_warning = (
+                discovery_warning or "Discovery returned no usable symbols"
+            )
+    else:
+        # Strict validation applies only to client-supplied input.
+        # Auto-discovered symbols are validated by the discovery service
+        # and legitimately include formats like "BRK.B".
+        symbol_list = (
+            [s.strip().upper() for s in symbols.split(",") if s.strip()]
+            if symbols
+            else list(DEFAULT_SYMBOLS)
+        )
+        if not symbol_list or len(symbol_list) > 50 or any(
+            not s.isalnum() or len(s) > 10 for s in symbol_list
+        ):
+            raise HTTPException(status_code=422, detail="Invalid symbols list")
 
     overrides = {}
     if min_rvol is not None:
@@ -75,7 +112,7 @@ def hot_stocks(
     config = ScannerConfig(**overrides)
 
     try:
-        results = scan_hot_stocks(symbol_list, config=config)
+        results = scan_hot_stocks(symbol_list, config=config) if symbol_list else []
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except APIError as exc:
@@ -83,6 +120,11 @@ def hot_stocks(
 
     return {
         "as_of": datetime.now(timezone.utc).isoformat(),
+        "discovery_mode": discovery_mode,
+        "discovery_source": discovery_source,
+        "discovery_as_of": discovery_as_of,
+        "discovery_warning": discovery_warning,
+        "is_fallback": is_fallback,
         "universe": symbol_list,
         "total_scanned": len(results),
         "eligible_count": sum(r.classification == "eligible" for r in results),

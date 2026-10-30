@@ -32,11 +32,15 @@ Credentials come from `.env` (see `.env.example`): `ALPACA_API_KEY`,
 
 ## Intraday hot-stock scanner
 
-`GET /api/scanner/hot-stocks` ranks the default universe (or
-`?symbols=A,B,C`) on 1-minute bars: intraday % change vs prior close,
+`GET /api/scanner/hot-stocks` ranks symbols on 1-minute bars. `?mode=auto`
+(default) discovers the universe via Alpaca's market-movers and
+most-actives screeners, falling back — explicitly flagged — to the curated
+universe if the account lacks screener access. `?mode=manual` or an
+explicit `?symbols=A,B,C` list scans a fixed set. Metrics: intraday % change vs prior close,
 relative volume vs a same-time-of-day baseline over prior sessions, dollar
-volume, 30-minute momentum, and quoted spread. Optional `?top=` and
-`?min_rvol=` parameters. Scores are a transparent ranking heuristic, not a
+volume, 30-minute momentum, and quoted spread. Optional `?top=`,
+`?min_rvol=`, and `?min_change_pct=` parameters. Scores are a transparent
+ranking heuristic, not a
 return forecast. Read-only — no orders.
 
 Feed caveat: the default `iex` feed only reports IEX executions, so volumes

@@ -66,6 +66,11 @@ type ScanMeta = {
   universe: string[];
   total_scanned: number;
   eligible_count: number;
+  discovery_mode: string;
+  discovery_source: string;
+  discovery_as_of: string | null;
+  discovery_warning: string | null;
+  is_fallback: boolean;
 };
 
 const classificationStyles: Record<string, string> = {
@@ -104,6 +109,8 @@ export default function Home() {
   const [scanError, setScanError] = useState("");
   const [scanAsOf, setScanAsOf] = useState("");
   const [eligibleOnly, setEligibleOnly] = useState(false);
+  const [scanMode, setScanMode] = useState<"auto" | "manual">("auto");
+  const [manualSymbols, setManualSymbols] = useState("");
 
   async function runBacktest() {
     setLoading(true);
@@ -144,8 +151,15 @@ export default function Home() {
     setScanLoading(true);
     setScanError("");
 
+    const params = new URLSearchParams({ mode: scanMode });
+    if (scanMode === "manual" && manualSymbols.trim()) {
+      params.set("symbols", manualSymbols.trim());
+    }
+
     try {
-      const response = await fetch("/api/scanner/hot-stocks");
+      const response = await fetch(
+        `/api/scanner/hot-stocks?${params.toString()}`,
+      );
       const data = await response.json();
 
       if (!response.ok) {
@@ -161,6 +175,11 @@ export default function Home() {
         universe: data.universe ?? [],
         total_scanned: data.total_scanned ?? 0,
         eligible_count: data.eligible_count ?? 0,
+        discovery_mode: data.discovery_mode ?? "manual",
+        discovery_source: data.discovery_source ?? "manual",
+        discovery_as_of: data.discovery_as_of ?? null,
+        discovery_warning: data.discovery_warning ?? null,
+        is_fallback: data.is_fallback ?? false,
       });
       setScanAsOf(data.as_of ?? "");
     } catch (err) {
@@ -372,21 +391,70 @@ export default function Home() {
             </div>
           </div>
 
+          <div className="mb-6 flex flex-wrap items-center gap-3">
+            <div className="flex rounded-lg border border-white/10 p-1 text-xs font-medium">
+              {(["auto", "manual"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setScanMode(mode)}
+                  className={`rounded-md px-3 py-1.5 transition ${
+                    scanMode === mode
+                      ? "bg-amber-600 text-white"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  {mode === "auto" ? "Auto Discover" : "Manual Symbols"}
+                </button>
+              ))}
+            </div>
+            {scanMode === "manual" && (
+              <input
+                type="text"
+                value={manualSymbols}
+                onChange={(e) => setManualSymbols(e.target.value)}
+                placeholder="NVDA, TSLA, AMD (blank = default universe)"
+                className="w-72 rounded-lg border border-white/10 bg-[#080d17] px-3 py-1.5 text-xs outline-none focus:border-amber-500"
+              />
+            )}
+          </div>
+
           {scanMeta && (
-            <p className="mb-4 text-xs text-slate-400">
-              <span className="font-semibold text-emerald-400">
-                {scanMeta.eligible_count} eligible
-              </span>
-              {" · "}
-              {scanMeta.total_scanned} scanned
-              {" · Universe: "}
-              {scanMeta.universe.join(", ")}
-              {scanAsOf &&
-                ` · Scanned at ${new Date(scanAsOf).toLocaleString(
-                  undefined,
-                  { dateStyle: "medium", timeStyle: "medium" },
-                )}`}
-            </p>
+            <div className="mb-4 space-y-1.5 text-xs text-slate-400">
+              {scanMeta.discovery_warning && (
+                <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-300">
+                  {scanMeta.discovery_warning}
+                </p>
+              )}
+              <p>
+                {scanMeta.discovery_mode === "auto"
+                  ? "Auto discovery"
+                  : "Manual universe"}
+                {" · Source: "}
+                <span className="font-medium text-slate-300">
+                  {scanMeta.discovery_source}
+                </span>
+                {" · "}
+                {scanMeta.universe.length} discovered
+                {" · "}
+                {scanMeta.total_scanned} evaluated
+                {" · "}
+                <span className="font-semibold text-emerald-400">
+                  {scanMeta.eligible_count} eligible
+                </span>
+                {scanMeta.discovery_as_of &&
+                  ` · Discovered ${new Date(
+                    scanMeta.discovery_as_of,
+                  ).toLocaleString(undefined, {
+                    dateStyle: "medium",
+                    timeStyle: "medium",
+                  })}`}
+                {scanAsOf &&
+                  ` · Scanned ${new Date(scanAsOf).toLocaleString(
+                    undefined,
+                    { dateStyle: "medium", timeStyle: "medium" },
+                  )}`}
+              </p>
+            </div>
           )}
 
           {scanError && (
