@@ -190,6 +190,34 @@ def test_future_prices_do_not_change_past_equity():
                     volume=1_000_000,
                 )
             )
+
+        return bars
+
+    history_a = {
+        "SPY": make_bars(500),
+        "AAPL": make_bars(100),
+        "MSFT": make_bars(200),
+        "NVDA": make_bars(150),
+    }
+
+    history_b = {
+        "SPY": make_bars(500),
+        "AAPL": make_bars(100, future_multiplier=3.0),
+        "MSFT": make_bars(200, future_multiplier=0.3),
+        "NVDA": make_bars(150, future_multiplier=5.0),
+    }
+
+    result_a = run_backtest(history_a)
+    result_b = run_backtest(history_b)
+
+    # Both simulations must agree before session 40.
+    assert result_a.equity_curve[:19] == result_b.equity_curve[:19]
+    assert result_a.position_counts[:19] == result_b.position_counts[:19]
+
+    # Confirm that the changed future actually affects results.
+    assert result_a.final_equity != pytest.approx(result_b.final_equity)
+
+
 def test_closed_trades_respect_holding_period():
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
@@ -222,6 +250,15 @@ def test_closed_trades_respect_holding_period():
         "AAPL": make_bars(100),
         "MSFT": make_bars(200),
     }
+
+    result = run_backtest(history, hold_sessions=5)
+
+    assert result.closed_trades
+
+    for trade in result.closed_trades:
+        entry = datetime.fromisoformat(trade.entry_date).date()
+        exit_ = datetime.fromisoformat(trade.exit_date).date()
+        assert (exit_ - entry).days == 5
 
 
 def test_missing_exit_price_delays_sale():

@@ -30,6 +30,10 @@ def test_backtest_endpoint():
         max_drawdown_pct=2.0,
         trades=2,
         selected_symbols=("AAPL", "MSFT"),
+        benchmark_equity_curve=(
+            ("2026-01-05", 1000.0),
+            ("2026-01-06", 1005.0),
+        ),
     )
 
     with (
@@ -51,6 +55,10 @@ def test_backtest_endpoint():
     assert data["final_equity"] == 1050.0
     assert data["return_pct"] == 5.0
     assert data["selected_symbols"] == ["AAPL", "MSFT"]
+    assert data["benchmark_equity_curve"] == [
+        ["2026-01-05", 1000.0],
+        ["2026-01-06", 1005.0],
+    ]
 
     fetch.assert_called_once()
     run.assert_called_once_with(

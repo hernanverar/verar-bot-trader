@@ -41,7 +41,7 @@ class BacktestResult:
     equity_curve: tuple[tuple[str, float], ...] = ()
     position_counts: tuple[tuple[str, int], ...] = ()
     unrealized_pnl: float = 0.0
-
+    benchmark_equity_curve: tuple[tuple[str, float], ...] = ()
 
 def fetch_history(symbols: list[str], days: int = 440) -> dict[str, list]:
     """Fetch enough daily bars for a one-year test and a warm-up window."""
@@ -208,18 +208,35 @@ def run_backtest(history, initial_cash=INITIAL_CASH,
 
     benchmark_start = spy[dates[WARMUP_SESSIONS]].open
     benchmark_end = spy[dates[-1]].close
-    benchmark = (
-        (benchmark_end / benchmark_start - 1) * 100
-        if _valid_price(benchmark_start)
-        and _valid_price(benchmark_end)
-        else None
-    )
+    benchmark = None
+    benchmark_curve = []
+
+    if _valid_price(benchmark_start) and _valid_price(benchmark_end):
+        benchmark = (benchmark_end / benchmark_start - 1) * 100
+        last_valid_close = None
+        for day in dates[WARMUP_SESSIONS:]:
+            close = spy[day].close
+            if _valid_price(close):
+                last_valid_close = close
+            if last_valid_close is not None:
+                benchmark_curve.append(
+                    (str(day), initial_cash * last_valid_close / benchmark_start)
+                )
 
     return BacktestResult(
-       initial_cash, final_equity, (final_equity / initial_cash - 1) * 100,
-        benchmark, max_dd, entries, tuple(sorted(selected)),
-        tuple(closed), total_costs, tuple(curve), tuple(position_counts),
-        unrealized_pnl
+        initial_cash=initial_cash,
+        final_equity=final_equity,
+        return_pct=(final_equity / initial_cash - 1) * 100,
+        benchmark_return_pct=benchmark,
+        max_drawdown_pct=max_dd,
+        trades=entries,
+        selected_symbols=tuple(sorted(selected)),
+        closed_trades=tuple(closed),
+        total_costs=total_costs,
+        equity_curve=tuple(curve),
+        position_counts=tuple(position_counts),
+        unrealized_pnl=unrealized_pnl,
+        benchmark_equity_curve=tuple(benchmark_curve),
     )
 
 
@@ -255,12 +272,12 @@ def backtest_report(result):
         f"Entries:          {result.trades}\n"
         f"Closed trades:    {len(trades)}\n"
         f"Win rate:         {win_rate:.1f}%\n"
-        f"Closed gross P/L: ${gross:+.2f}\n"
-        f"Closed costs:     ${closed_costs:.2f}\n"
+        f"Gross P/L:        ${gross:+.2f}\n"
         f"Realized P/L:     ${realized_pnl:+.2f}\n"
-        f"Unrealized P/L:   ${result.unrealized_pnl:+.2f} (after entry costs)\n"
-        f"Open entry costs: ${open_entry_costs:.2f} (already included above)\n"
-        f"Total costs:      ${result.total_costs:.2f} (informational)\n"
+        f"Unrealized P/L:   ${result.unrealized_pnl:+.2f}\n"
+        f"Total costs:      ${result.total_costs:.2f}\n"
+        f"Closed costs:     ${closed_costs:.2f}\n"
+        f"Open costs:       ${open_entry_costs:.2f}\n"
         f"Net P/L:          ${result.final_equity-result.initial_cash:+.2f}\n"
         f"P/L by symbol:    {breakdown}\n"
         "Assumptions: daily evaluation, max 3 positions, "
