@@ -1,3 +1,6 @@
-pytest>=8,<10
 alpaca-py
 python-dotenv
+pytest>=8,<10
+fastapi
+uvicorn[standard]
+httpx
