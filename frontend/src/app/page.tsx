@@ -7,6 +7,7 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   BarChart3,
+  Flame,
   LoaderCircle,
   Play,
   ShieldCheck,
@@ -44,6 +45,36 @@ type BacktestResult = {
   benchmark_equity_curve: [string, number][];
 };
 
+type HotStock = {
+  symbol: string;
+  last_price: number | null;
+  change_pct: number | null;
+  relative_volume: number | null;
+  cum_volume: number;
+  dollar_volume: number;
+  momentum_pct: number | null;
+  spread_bps: number | null;
+  score: number | null;
+  classification: "eligible" | "filtered" | "unavailable";
+  reasons: string[];
+  bar_freshness: "fresh" | "stale" | "none";
+  quote_available: boolean;
+  as_of: string | null;
+};
+
+type ScanMeta = {
+  universe: string[];
+  total_scanned: number;
+  eligible_count: number;
+};
+
+const classificationStyles: Record<string, string> = {
+  eligible:
+    "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
+  filtered: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+  unavailable: "border-slate-500/30 bg-slate-500/10 text-slate-400",
+};
+
 const money = (value: number) =>
   new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -53,6 +84,13 @@ const money = (value: number) =>
 const percent = (value: number) =>
   `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 
+const compactMoney = (value: number) =>
+  value >= 1e9
+    ? `$${(value / 1e9).toFixed(1)}B`
+    : value >= 1e6
+      ? `$${(value / 1e6).toFixed(1)}M`
+      : money(value);
+
 export default function Home() {
   const [initialCash, setInitialCash] = useState(1000);
   const [holdSessions, setHoldSessions] = useState(5);
@@ -60,6 +98,12 @@ export default function Home() {
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [hotStocks, setHotStocks] = useState<HotStock[] | null>(null);
+  const [scanMeta, setScanMeta] = useState<ScanMeta | null>(null);
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanError, setScanError] = useState("");
+  const [scanAsOf, setScanAsOf] = useState("");
+  const [eligibleOnly, setEligibleOnly] = useState(false);
 
   async function runBacktest() {
     setLoading(true);
@@ -96,6 +140,38 @@ export default function Home() {
     }
   }
 
+  async function runScan() {
+    setScanLoading(true);
+    setScanError("");
+
+    try {
+      const response = await fetch("/api/scanner/hot-stocks");
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : data.error || "Scan failed",
+        );
+      }
+
+      setHotStocks(data.results ?? []);
+      setScanMeta({
+        universe: data.universe ?? [],
+        total_scanned: data.total_scanned ?? 0,
+        eligible_count: data.eligible_count ?? 0,
+      });
+      setScanAsOf(data.as_of ?? "");
+    } catch (err) {
+      setScanError(
+        err instanceof Error ? err.message : "Unexpected error",
+      );
+    } finally {
+      setScanLoading(false);
+    }
+  }
+
   const benchmarkByDate = new Map<string, number>(
     result?.benchmark_equity_curve ?? [],
   );
@@ -111,6 +187,11 @@ export default function Home() {
             : null,
       };
     }) ?? [];
+
+  const displayedStocks =
+    hotStocks?.filter(
+      (s) => !eligibleOnly || s.classification === "eligible",
+    ) ?? [];
 
   const cards = result
     ? [
@@ -249,6 +330,155 @@ export default function Home() {
             <p role="alert" className="mt-4 text-sm text-red-400">
               {error}
             </p>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-white/10 bg-[#111b2d] p-6">
+          <div className="mb-6 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Flame className="text-amber-400" size={20} />
+              <div>
+                <h3 className="text-lg font-semibold">
+                  Hot Stocks — Intraday Scanner
+                </h3>
+                <p className="text-sm text-slate-400">
+                  Read-only momentum and volume scan. Ranking heuristic,
+                  not a recommendation.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-4">
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={eligibleOnly}
+                  onChange={(e) => setEligibleOnly(e.target.checked)}
+                  className="h-4 w-4 accent-emerald-500"
+                />
+                Eligible only
+              </label>
+              <button
+                onClick={runScan}
+                disabled={scanLoading}
+                className="flex items-center gap-2 rounded-lg bg-amber-600 px-4 py-2 text-sm font-semibold transition hover:bg-amber-500 disabled:opacity-50"
+              >
+                {scanLoading ? (
+                  <LoaderCircle className="animate-spin" size={16} />
+                ) : (
+                  <Flame size={16} />
+                )}
+                {scanLoading ? "Scanning..." : "Run Scan"}
+              </button>
+            </div>
+          </div>
+
+          {scanMeta && (
+            <p className="mb-4 text-xs text-slate-400">
+              <span className="font-semibold text-emerald-400">
+                {scanMeta.eligible_count} eligible
+              </span>
+              {" · "}
+              {scanMeta.total_scanned} scanned
+              {" · Universe: "}
+              {scanMeta.universe.join(", ")}
+              {scanAsOf &&
+                ` · Scanned at ${new Date(scanAsOf).toLocaleString(
+                  undefined,
+                  { dateStyle: "medium", timeStyle: "medium" },
+                )}`}
+            </p>
+          )}
+
+          {scanError && (
+            <p role="alert" className="mb-4 text-sm text-red-400">
+              {scanError}
+            </p>
+          )}
+
+          {hotStocks === null ? (
+            <p className="py-8 text-center text-sm text-slate-500">
+              Run a scan to rank the universe by intraday momentum,
+              relative volume, and liquidity.
+            </p>
+          ) : hotStocks.length === 0 ? (
+            <p className="py-8 text-center text-sm text-slate-500">
+              No candidates returned. The market may be closed or data
+              may be unavailable.
+            </p>
+          ) : displayedStocks.length === 0 ? (
+            <p className="py-8 text-center text-sm text-slate-500">
+              No eligible candidates — {scanMeta?.total_scanned ?? 0}{" "}
+              symbols scanned, all filtered or unavailable.
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-white/10 text-slate-400">
+                  <tr>
+                    <th className="pb-3">Symbol</th>
+                    <th className="pb-3">Status</th>
+                    <th className="pb-3 text-right">Price</th>
+                    <th className="pb-3 text-right">Change %</th>
+                    <th className="pb-3 text-right">Rel Vol</th>
+                    <th className="pb-3 text-right">$ Volume</th>
+                    <th className="pb-3 text-right">Score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {displayedStocks.map((stock) => (
+                    <tr
+                      key={stock.symbol}
+                      className="border-b border-white/5"
+                    >
+                      <td className="py-3 font-semibold">
+                        {stock.symbol}
+                        {stock.reasons.length > 0 && (
+                          <p className="mt-0.5 max-w-64 text-xs font-normal text-slate-500">
+                            {stock.reasons.join("; ")}
+                          </p>
+                        )}
+                      </td>
+                      <td className="py-3">
+                        <span
+                          className={`inline-block rounded-full border px-2 py-0.5 text-xs font-medium ${classificationStyles[stock.classification] ?? classificationStyles.unavailable}`}
+                        >
+                          {stock.classification}
+                        </span>
+                      </td>
+                      <td className="py-3 text-right tabular-nums">
+                        {stock.last_price !== null
+                          ? money(stock.last_price)
+                          : "—"}
+                      </td>
+                      <td
+                        className={`py-3 text-right tabular-nums ${
+                          (stock.change_pct ?? 0) >= 0
+                            ? "text-emerald-400"
+                            : "text-red-400"
+                        }`}
+                      >
+                        {stock.change_pct !== null
+                          ? percent(stock.change_pct * 100)
+                          : "—"}
+                      </td>
+                      <td className="py-3 text-right tabular-nums">
+                        {stock.relative_volume !== null
+                          ? `${stock.relative_volume.toFixed(1)}x`
+                          : "—"}
+                      </td>
+                      <td className="py-3 text-right tabular-nums">
+                        {compactMoney(stock.dollar_volume)}
+                      </td>
+                      <td className="py-3 text-right font-semibold tabular-nums">
+                        {stock.score !== null
+                          ? stock.score.toFixed(1)
+                          : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
 

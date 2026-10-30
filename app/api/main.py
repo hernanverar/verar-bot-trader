@@ -1,10 +1,13 @@
 from dataclasses import asdict
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from alpaca.common.exceptions import APIError
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.backtest import fetch_history, run_backtest
 from app.market_data import DEFAULT_SYMBOLS
+from app.strategies.hot_stock_scanner import ScannerConfig, scan_hot_stocks
 
 app = FastAPI(
     title="VERAR BOT TRADER API",
@@ -44,3 +47,44 @@ def execute_backtest(request: BacktestRequest):
         return asdict(result)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/scanner/hot-stocks")
+def hot_stocks(
+    symbols: str | None = None,
+    top: int = Query(default=20, ge=1, le=100),
+    min_rvol: float | None = Query(default=None, ge=0),
+    min_change_pct: float | None = Query(default=None),
+):
+    """Rank intraday hot stocks. Read-only market data; never places orders."""
+    if symbols:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        symbol_list = list(DEFAULT_SYMBOLS)
+
+    if not symbol_list or len(symbol_list) > 50 or any(
+        not s.isalnum() or len(s) > 10 for s in symbol_list
+    ):
+        raise HTTPException(status_code=422, detail="Invalid symbols list")
+
+    overrides = {}
+    if min_rvol is not None:
+        overrides["min_rvol"] = min_rvol
+    if min_change_pct is not None:
+        overrides["min_positive_change_pct"] = min_change_pct
+    config = ScannerConfig(**overrides)
+
+    try:
+        results = scan_hot_stocks(symbol_list, config=config)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
+
+    return {
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "universe": symbol_list,
+        "total_scanned": len(results),
+        "eligible_count": sum(r.classification == "eligible" for r in results),
+        "results": [asdict(r) for r in results[:top]],
+    }

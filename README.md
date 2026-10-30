@@ -30,4 +30,17 @@ Credentials come from `.env` (see `.env.example`): `ALPACA_API_KEY`,
 `ALPACA_SECRET_KEY`, and optionally `ALPACA_DATA_FEED` (`iex` for free plans,
 `sip` for paid).
 
+## Intraday hot-stock scanner
+
+`GET /api/scanner/hot-stocks` ranks the default universe (or
+`?symbols=A,B,C`) on 1-minute bars: intraday % change vs prior close,
+relative volume vs a same-time-of-day baseline over prior sessions, dollar
+volume, 30-minute momentum, and quoted spread. Optional `?top=` and
+`?min_rvol=` parameters. Scores are a transparent ranking heuristic, not a
+return forecast. Read-only — no orders.
+
+Feed caveat: the default `iex` feed only reports IEX executions, so volumes
+understate the consolidated tape. `sip` requires a paid subscription and is
+delayed ~15 minutes on free plans, so near-real-time scanning needs IEX.
+
 Next steps: point-in-time universe selection, historical backtesting with transaction costs, and a paper-only broker adapter.
