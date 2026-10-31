@@ -17,7 +17,7 @@ consolidated tape volume for all symbols roughly uniformly.
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from app.intraday_data import (
     bars_by_session,
@@ -31,6 +31,7 @@ from app.market_data import (
     get_data_client,
     spread_bps_from_quote,
 )
+from app.market_session import MarketSessionInfo, get_market_session
 
 LOOKBACK_CALENDAR_DAYS = 15  # covers weekends/holidays around ~7 sessions
 
@@ -71,9 +72,12 @@ class HotStock:
     momentum_pct: float | None
     spread_bps: float | None
     score: float | None
-    classification: str  # eligible | filtered | unavailable
+    classification: str  # eligible | research | filtered | unavailable
     reasons: tuple[str, ...]
-    bar_freshness: str  # fresh | stale | none
+    research_eligible: bool  # passes all evaluable gates for this session
+    bar_status: str  # live | session_ended | stale | none
+    bar_age_min: float | None
+    bar_freshness: str  # legacy: fresh | stale | none
     quote_available: bool
     as_of: datetime | None
 
@@ -145,12 +149,51 @@ def _score(
     return round(100 * sum(w * v for w, v in parts) / total_weight, 1)
 
 
+def _bar_status(
+    as_of: datetime | None,
+    session_info: MarketSessionInfo,
+    config: ScannerConfig,
+    now: datetime,
+) -> tuple[str, float | None]:
+    """Classify the latest bar's timeliness.
+
+    "live" — fresh bar during the regular session.
+    "session_ended" — latest bar is the expected final bar of the most
+    recent regular session; normal after hours, not a broken feed.
+    "stale" — data stops unexpectedly (mid-session gap during regular
+    hours, or missing the most recent session entirely).
+    """
+    if as_of is None:
+        return "none", None
+    age_min = (now - as_of).total_seconds() / 60
+    if session_info.session == "regular":
+        return ("live" if age_min <= config.stale_after_min else "stale"), age_min
+
+    last_session = session_info.last_regular_session
+    if last_session is None:
+        return "stale", age_min
+    bar_day = as_of.astimezone(MARKET_TZ).date()
+    if bar_day != last_session:
+        return "stale", age_min  # no bars from the most recent session
+
+    close_t = (
+        session_info.session_close
+        if last_session == session_info.as_of.date() and session_info.session_close
+        else time(16, 0)
+    )
+    close_dt = datetime.combine(last_session, close_t, tzinfo=MARKET_TZ)
+    minutes_before_close = (close_dt - as_of).total_seconds() / 60
+    window = max(config.stale_after_min * 2, 15)
+    return ("session_ended" if -5 <= minutes_before_close <= window else "stale"), age_min
+
+
 def _evaluate(
     symbol: str,
     bars: list,
     quote,
     config: ScannerConfig,
     now: datetime,
+    session_info: MarketSessionInfo,
 ) -> HotStock:
     today = now.astimezone(MARKET_TZ).date()
     sessions = bars_by_session(bars)
@@ -158,19 +201,20 @@ def _evaluate(
     if not today_bars:
         return HotStock(
             symbol, None, None, None, 0, 0.0, None, None, None,
-            "unavailable", ("no intraday bars",), "none", False, None,
+            "unavailable", ("no intraday bars",), False, "none", None, "none", False, None,
         )
 
     as_of = today_bars[-1].timestamp
     last_price = today_bars[-1].close
     cum_volume = sum(b.volume for b in today_bars)
     dollar_volume = sum(b.close * b.volume for b in today_bars)
+    bar_status, bar_age_min = _bar_status(as_of, session_info, config, now)
 
     if not last_price or last_price <= 0:
         return HotStock(
             symbol, last_price, None, None, cum_volume, dollar_volume, None,
-            None, None, "unavailable", ("no usable price",),
-            "stale" if now - as_of > timedelta(minutes=config.stale_after_min) else "fresh",
+            None, None, "unavailable", ("no usable price",), False, bar_status,
+            bar_age_min, "fresh" if bar_status in ("live", "session_ended") else bar_status,
             False, as_of,
         )
 
@@ -183,10 +227,8 @@ def _evaluate(
 
     momentum_pct = _momentum_pct(today_bars, config.momentum_window_min)
     spread_bps = spread_bps_from_quote(quote)
-
-    staleness_min = (now - as_of).total_seconds() / 60
-    bar_freshness = "stale" if staleness_min > config.stale_after_min else "fresh"
     quote_available = spread_bps is not None
+    regular = session_info.session == "regular"
 
     reasons = []
     if change_pct is None:
@@ -205,22 +247,35 @@ def _evaluate(
         )
     if last_price < config.min_price:
         reasons.append(f"price ${last_price:.2f} below ${config.min_price:.2f} minimum")
-    if bar_freshness == "stale" and config.require_fresh_data:
-        reasons.append(f"stale bars ({staleness_min:.0f}m old)")
-    if not quote_available:
+    if bar_status == "stale":
+        if regular and config.require_fresh_data:
+            reasons.append(f"stale bars ({bar_age_min:.0f}m old)")
+        elif not regular:
+            reasons.append("bars end before latest session close")
+    if regular and not quote_available:
         reasons.append("no usable quote")
 
     score = _score(change_pct, rvol, dollar_volume, momentum_pct, spread_bps, config)
-    classification = "eligible" if not reasons else "filtered"
+    # Conservative: a heuristic weekday "regular" session without verified
+    # calendar data cannot produce live-eligible candidates.
+    live_session = regular and session_info.calendar_verified
+    if reasons:
+        classification = "filtered"
+    elif live_session:
+        classification = "eligible"
+    else:
+        classification = "research"
 
     return HotStock(
         symbol, last_price, change_pct, rvol, cum_volume, dollar_volume,
         momentum_pct, spread_bps, score, classification, tuple(reasons),
-        bar_freshness, quote_available, as_of,
+        classification in ("eligible", "research"), bar_status, bar_age_min,
+        "fresh" if bar_status in ("live", "session_ended") else bar_status,
+        quote_available, as_of,
     )
 
 
-_CLASSIFICATION_ORDER = {"eligible": 0, "filtered": 1, "unavailable": 2}
+_CLASSIFICATION_ORDER = {"eligible": 0, "research": 1, "filtered": 2, "unavailable": 3}
 
 
 def scan_hot_stocks(
@@ -228,16 +283,19 @@ def scan_hot_stocks(
     client=None,
     config: ScannerConfig | None = None,
     now: datetime | None = None,
+    session_info: MarketSessionInfo | None = None,
 ) -> list[HotStock]:
     """Scan symbols with 1-minute bars.
 
-    Ordering: eligible first, then filtered, then unavailable — each group by
-    descending score. A high score never overrides classification.
+    Ordering: eligible first, then research, then filtered, then
+    unavailable — each group by descending score. `eligible` is only
+    possible during the regular session.
     """
     config = config or ScannerConfig()
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    session_info = session_info or get_market_session(now)
     client = client or get_data_client()
 
     bars_by_symbol = fetch_minute_bars(
@@ -249,7 +307,7 @@ def scan_hot_stocks(
     quotes = fetch_latest_quotes(client, symbols)
 
     results = [
-        _evaluate(symbol, completed.get(symbol, []), quotes.get(symbol), config, now)
+        _evaluate(symbol, completed.get(symbol, []), quotes.get(symbol), config, now, session_info)
         for symbol in symbols
     ]
     return sorted(

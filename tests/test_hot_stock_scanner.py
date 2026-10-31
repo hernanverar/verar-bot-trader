@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.intraday_data import completed_minute_bars
+from app.market_session import get_market_session
 from app.strategies.hot_stock_scanner import (
     ScannerConfig,
     scan_hot_stocks,
@@ -15,6 +16,15 @@ ET = ZoneInfo("America/New_York")
 NOW = datetime(2026, 1, 15, 11, 0, tzinfo=ET)
 TODAY = NOW.date()
 PRIOR_DAYS = [date(2026, 1, 12), date(2026, 1, 13), date(2026, 1, 14)]
+
+TRADING_DAYS = {
+    d: (time(9, 30), time(16, 0)) for d in [TODAY, *PRIOR_DAYS]
+}
+
+
+def verified_session(now=NOW):
+    """Calendar-verified session info — without it no test can be eligible."""
+    return get_market_session(now=now, trading_days=TRADING_DAYS)
 
 
 @dataclass
@@ -94,7 +104,7 @@ def test_completed_minute_filter_drops_unfinished_bar():
 def test_scan_computes_change_rvol_and_score():
     bars = hot_day_bars("AAA")
     quotes = {"AAA": FakeQuote("AAA", NOW, 102.9, 103.1)}
-    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}, quotes), now=NOW)
+    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}, quotes), now=NOW, session_info=verified_session(NOW))
 
     stock = results[0]
     assert stock.classification == "eligible"
@@ -116,7 +126,7 @@ def test_scan_reports_unavailable_symbol():
     results = scan_hot_stocks(
         ["AAA", "ZZZ"],
         client=FakeClient({"AAA": hot_day_bars("AAA")}, {"AAA": FakeQuote("AAA", NOW, 102.9, 103.1)}),
-        now=NOW,
+        now=NOW, session_info=verified_session(NOW),
     )
     by_symbol = {r.symbol: r for r in results}
     assert by_symbol["ZZZ"].classification == "unavailable"
@@ -132,7 +142,7 @@ def test_declining_stock_is_filtered_not_eligible():
         bars += minute_bars("AAA", d, 90, 100.0, 100.0, 1_000)
     bars += minute_bars("AAA", TODAY, 90, 100.0, 96.0, 3_000)
     quotes = {"AAA": FakeQuote("AAA", NOW, 95.9, 96.1)}
-    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}, quotes), now=NOW)
+    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}, quotes), now=NOW, session_info=verified_session(NOW))
 
     stock = results[0]
     assert stock.classification == "filtered"
@@ -143,7 +153,7 @@ def test_declining_stock_is_filtered_not_eligible():
 def test_stale_and_missing_baseline_flagged_independently():
     # Only today's bars, ending an hour before `now`.
     bars = minute_bars("AAA", TODAY, 30, 100.0, 104.0, 5_000)
-    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}), now=NOW)
+    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}), now=NOW, session_info=verified_session(NOW))
     stock = results[0]
     assert stock.classification == "filtered"
     assert stock.bar_freshness == "stale"
@@ -162,7 +172,7 @@ def test_stale_ok_when_freshness_not_required():
     bars += minute_bars("AAA", TODAY, 75, 100.0, 104.0, 3_000)
     quotes = {"AAA": FakeQuote("AAA", NOW, 103.9, 104.1)}
 
-    strict = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}, quotes), now=NOW)
+    strict = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}, quotes), now=NOW, session_info=verified_session(NOW))
     assert strict[0].classification == "filtered"
     assert any(r.startswith("stale bars") for r in strict[0].reasons)
 
@@ -170,7 +180,7 @@ def test_stale_ok_when_freshness_not_required():
         ["AAA"],
         client=FakeClient({"AAA": bars}, quotes),
         config=ScannerConfig(require_fresh_data=False),
-        now=NOW,
+        now=NOW, session_info=verified_session(NOW),
     )
     assert relaxed[0].classification == "eligible"
 
@@ -182,7 +192,7 @@ def test_min_rvol_gate_filters_low_volume_stock():
         bars += minute_bars("AAA", d, 90, 100.0, 100.0, 50_000)
     bars += minute_bars("AAA", TODAY, 90, 100.0, 103.0, 5_000)
     config = ScannerConfig(min_rvol=1.5)
-    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}), config=config, now=NOW)
+    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}), config=config, now=NOW, session_info=verified_session(NOW))
     assert results[0].classification == "filtered"
     assert any(r.startswith("rvol") and "below" in r for r in results[0].reasons)
 
@@ -191,7 +201,7 @@ def test_min_dollar_volume_gate():
     bars = minute_bars("AAA", TODAY, 30, 100.0, 104.0, 10)  # tiny volume
     for d in PRIOR_DAYS:
         bars += minute_bars("AAA", d, 30, 100.0, 100.0, 10)
-    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}), now=NOW)
+    results = scan_hot_stocks(["AAA"], client=FakeClient({"AAA": bars}), now=NOW, session_info=verified_session(NOW))
     assert results[0].classification == "filtered"
     assert any("dollar volume" in r for r in results[0].reasons)
 
@@ -212,7 +222,7 @@ def test_eligible_ranks_above_higher_scored_filtered():
     results = scan_hot_stocks(
         ["AAA", "BBB"],
         client=FakeClient({"AAA": bars_a, "BBB": bars_b}, quotes),
-        now=NOW,
+        now=NOW, session_info=verified_session(NOW),
     )
     by_symbol = {r.symbol: r for r in results}
     assert by_symbol["AAA"].classification == "filtered"

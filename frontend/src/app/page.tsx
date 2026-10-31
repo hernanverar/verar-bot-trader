@@ -55,8 +55,10 @@ type HotStock = {
   momentum_pct: number | null;
   spread_bps: number | null;
   score: number | null;
-  classification: "eligible" | "filtered" | "unavailable";
+  classification: "eligible" | "research" | "filtered" | "unavailable";
   reasons: string[];
+  research_eligible: boolean;
+  bar_status: "live" | "session_ended" | "stale" | "none";
   bar_freshness: "fresh" | "stale" | "none";
   quote_available: boolean;
   as_of: string | null;
@@ -66,18 +68,31 @@ type ScanMeta = {
   universe: string[];
   total_scanned: number;
   eligible_count: number;
+  research_candidates_count: number;
+  excluded_instruments_count: number;
   discovery_mode: string;
   discovery_source: string;
   discovery_as_of: string | null;
   discovery_warning: string | null;
   is_fallback: boolean;
+  market_session: string;
+  market_is_open: boolean;
+  session_warning: string | null;
 };
 
 const classificationStyles: Record<string, string> = {
   eligible:
     "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
+  research: "border-blue-500/30 bg-blue-500/10 text-blue-400",
   filtered: "border-amber-500/30 bg-amber-500/10 text-amber-400",
   unavailable: "border-slate-500/30 bg-slate-500/10 text-slate-400",
+};
+
+const sessionLabels: Record<string, string> = {
+  pre_market: "Pre-Market",
+  regular: "Regular Hours",
+  after_hours: "After Hours",
+  closed: "Closed",
 };
 
 const money = (value: number) =>
@@ -175,11 +190,16 @@ export default function Home() {
         universe: data.universe ?? [],
         total_scanned: data.total_scanned ?? 0,
         eligible_count: data.eligible_count ?? 0,
+        research_candidates_count: data.research_candidates_count ?? 0,
+        excluded_instruments_count: data.excluded_instruments_count ?? 0,
         discovery_mode: data.discovery_mode ?? "manual",
         discovery_source: data.discovery_source ?? "manual",
         discovery_as_of: data.discovery_as_of ?? null,
         discovery_warning: data.discovery_warning ?? null,
         is_fallback: data.is_fallback ?? false,
+        market_session: data.market_session ?? "closed",
+        market_is_open: data.market_is_open ?? false,
+        session_warning: data.session_warning ?? null,
       });
       setScanAsOf(data.as_of ?? "");
     } catch (err) {
@@ -420,12 +440,32 @@ export default function Home() {
 
           {scanMeta && (
             <div className="mb-4 space-y-1.5 text-xs text-slate-400">
+              {!scanMeta.market_is_open && (
+                <p className="rounded-lg border border-slate-500/30 bg-slate-500/10 px-3 py-2 text-slate-300">
+                  Market closed — results are for research only.
+                </p>
+              )}
+              {scanMeta.session_warning && (
+                <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-300">
+                  {scanMeta.session_warning}
+                </p>
+              )}
               {scanMeta.discovery_warning && (
                 <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-300">
                   {scanMeta.discovery_warning}
                 </p>
               )}
               <p>
+                <span
+                  className={`mr-2 inline-block rounded-full border px-2 py-0.5 font-medium ${
+                    scanMeta.market_is_open
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                      : "border-slate-500/30 bg-slate-500/10 text-slate-300"
+                  }`}
+                >
+                  {sessionLabels[scanMeta.market_session] ??
+                    scanMeta.market_session}
+                </span>
                 {scanMeta.discovery_mode === "auto"
                   ? "Auto discovery"
                   : "Manual universe"}
@@ -435,11 +475,17 @@ export default function Home() {
                 </span>
                 {" · "}
                 {scanMeta.universe.length} discovered
+                {scanMeta.excluded_instruments_count > 0 &&
+                  ` · ${scanMeta.excluded_instruments_count} unsupported excluded`}
                 {" · "}
                 {scanMeta.total_scanned} evaluated
                 {" · "}
                 <span className="font-semibold text-emerald-400">
                   {scanMeta.eligible_count} eligible
+                </span>
+                {" · "}
+                <span className="font-semibold text-blue-400">
+                  {scanMeta.research_candidates_count} research
                 </span>
                 {scanMeta.discovery_as_of &&
                   ` · Discovered ${new Date(

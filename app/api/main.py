@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from app.backtest import fetch_history, run_backtest
 from app.market_data import DEFAULT_SYMBOLS
 from app.market_discovery import discover_momentum_universe, get_trading_client
+from app.market_session import get_market_session
 from app.strategies.hot_stock_scanner import ScannerConfig, scan_hot_stocks
 
 app = FastAPI(
@@ -69,12 +70,14 @@ def hot_stocks(
     discovery_as_of = None
     discovery_warning = None
     is_fallback = False
+    excluded_instruments_count = 0
+
+    try:
+        trading_client = get_trading_client()
+    except RuntimeError:
+        trading_client = None
 
     if discovery_mode == "auto":
-        try:
-            trading_client = get_trading_client()
-        except RuntimeError:
-            trading_client = None
         try:
             discovery = discover_momentum_universe(trading_client=trading_client)
         except RuntimeError as exc:
@@ -86,6 +89,7 @@ def hot_stocks(
         )
         discovery_warning = discovery.warning
         is_fallback = discovery.is_fallback
+        excluded_instruments_count = discovery.excluded_instruments_count
         if not symbol_list:
             discovery_warning = (
                 discovery_warning or "Discovery returned no usable symbols"
@@ -111,8 +115,14 @@ def hot_stocks(
         overrides["min_positive_change_pct"] = min_change_pct
     config = ScannerConfig(**overrides)
 
+    session_info = get_market_session(trading_client=trading_client)
+
     try:
-        results = scan_hot_stocks(symbol_list, config=config) if symbol_list else []
+        results = (
+            scan_hot_stocks(symbol_list, config=config, session_info=session_info)
+            if symbol_list
+            else []
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except APIError as exc:
@@ -120,13 +130,32 @@ def hot_stocks(
 
     return {
         "as_of": datetime.now(timezone.utc).isoformat(),
+        "market_session": session_info.session,
+        "market_timezone": session_info.timezone,
+        "market_is_open": session_info.is_open,
+        "calendar_verified": session_info.calendar_verified,
+        "session_warning": (
+            None
+            if session_info.calendar_verified
+            else "Market calendar unavailable — session times are heuristic; "
+                 "live eligibility disabled."
+        ),
+        "last_regular_session": (
+            session_info.last_regular_session.isoformat()
+            if session_info.last_regular_session
+            else None
+        ),
         "discovery_mode": discovery_mode,
         "discovery_source": discovery_source,
         "discovery_as_of": discovery_as_of,
         "discovery_warning": discovery_warning,
         "is_fallback": is_fallback,
+        "excluded_instruments_count": excluded_instruments_count,
         "universe": symbol_list,
         "total_scanned": len(results),
         "eligible_count": sum(r.classification == "eligible" for r in results),
+        "research_candidates_count": sum(
+            r.classification == "research" for r in results
+        ),
         "results": [asdict(r) for r in results[:top]],
     }

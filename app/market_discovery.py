@@ -11,6 +11,7 @@ a curated universe and say so explicitly — never silently.
 """
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ class DiscoveryResult:
     as_of: datetime | None
     is_fallback: bool
     warning: str | None
+    excluded_instruments_count: int = 0
 
 
 def _api_keys() -> tuple[str, str]:
@@ -78,28 +80,115 @@ def _fallback_universe(now: datetime, reason: str) -> DiscoveryResult:
     )
 
 
-def _filter_tradable(trading_client, symbols: list[str]) -> list[str]:
-    """Drop assets Alpaca reports as nonexistent/nontradable.
+# Suffixes after the final "." mapped to non-common-stock instrument types.
+# Other dotted suffixes (e.g. BRK.B, HEI.A) are legitimate class shares.
+_SUFFIX_TYPES = {
+    "WS": "warrant",
+    "RT": "right",
+    "U": "unit",
+    "UN": "unit",
+    "WI": "unsupported",  # when-issued
+}
+_PREFERRED_SUFFIX = re.compile(r"^(P[A-Z]|PR[A-Z]?)$")
+_NAME_RULES = [
+    ("warrant", "warrant"),
+    ("right", "right"),
+    ("unit", "unit"),
+    ("preferred", "preferred"),
+    ("preference", "preferred"),
+]
+# Exchange-traded products are not common stocks: ETFs/ETNs plus
+# leveraged/inverse ETPs identified by fund naming conventions.
+_ETP_NAME_PATTERNS = [
+    r"\bet[fnp]\b",              # ETF, ETN, ETP
+    r"\bexchange[- ]traded\b",
+    r"\b(inverse|leveraged|ultra|ultrapro)\b",
+    r"\b\d+(\.\d+)?x\b",         # 2X, 3X, 1.5X multipliers
+    r"\b(bull|bear)\b",
+]
+_NAME_RULES = [
+    ("warrant", "warrant"),
+    ("right", "right"),
+    ("unit", "unit"),
+    ("preferred", "preferred"),
+    ("preference", "preferred"),
+]
 
-    Only called when a trading client is supplied. A symbol is dropped on a
-    definitive 404 or `tradable=False`; ambiguous errors keep the symbol —
-    filtering on unreliable metadata would hide real candidates.
+_ASSET_CACHE: dict[str, object | None] = {}
+_ASSET_CACHE_MAX = 512
+
+
+def _suffix_instrument(symbol: str) -> str | None:
+    suffix = symbol.rsplit(".", 1)[-1].upper() if "." in symbol else ""
+    if suffix in _SUFFIX_TYPES:
+        return _SUFFIX_TYPES[suffix]
+    if _PREFERRED_SUFFIX.match(suffix):
+        return "preferred"
+    return None
+
+
+def classify_instrument(symbol: str, asset=None) -> str:
+    """common_stock | adr | warrant | right | unit | preferred |
+    unsupported | unverified — from suffix safeguards plus Alpaca metadata."""
+    suffix_kind = _suffix_instrument(symbol)
+    if suffix_kind is not None:
+        return suffix_kind
+
+    if asset is None:
+        return "unverified"
+
+    asset_class = getattr(asset, "asset_class", getattr(asset, "class_", None))
+    if asset_class is not None and "equity" not in str(asset_class).lower():
+        return "unsupported"
+    if getattr(asset, "tradable", True) is False:
+        return "unsupported"
+
+    name = (getattr(asset, "name", "") or "").lower()
+    if "american depositary" in name or re.search(r"\badr\b", name):
+        return "adr"
+    for keyword, instrument in _NAME_RULES:
+        if re.search(rf"\b{keyword}s?\b", name):
+            return instrument
+    for pattern in _ETP_NAME_PATTERNS:
+        if re.search(pattern, name):
+            return "etf"
+    return "common_stock"
+
+
+def _get_asset(trading_client, symbol: str):
+    if symbol in _ASSET_CACHE:
+        return _ASSET_CACHE[symbol]
+    try:
+        asset = trading_client.get_asset(symbol)
+    except Exception:
+        asset = None
+    if len(_ASSET_CACHE) >= _ASSET_CACHE_MAX:
+        _ASSET_CACHE.clear()
+    _ASSET_CACHE[symbol] = asset
+    return asset
+
+
+def _filter_instruments(trading_client, symbols: list[str]) -> tuple[list[str], int]:
+    """Keep verified common stocks/ADRs; return (kept, excluded_count).
+
+    With a trading client: definitive metadata decides — unverifiable
+    symbols are excluded rather than silently assumed common. Without one:
+    suffix safeguards only (best-effort, documented).
     """
-    kept = []
+    kept, excluded = [], 0
     for symbol in symbols:
-        try:
-            asset = trading_client.get_asset(symbol)
-        except APIError as exc:
-            if exc.status_code == 404:
-                continue
-            kept.append(symbol)
+        if trading_client is None:
+            if _suffix_instrument(symbol) is None:
+                kept.append(symbol)
+            else:
+                excluded += 1
             continue
-        except Exception:
+        kind = classify_instrument(symbol, asset=_get_asset(trading_client, symbol))
+        if kind in ("common_stock", "adr"):
             kept.append(symbol)
-            continue
-        if getattr(asset, "tradable", True):
-            kept.append(symbol)
-    return kept
+        else:
+            excluded += 1
+    return kept, excluded
 
 
 def discover_momentum_universe(
@@ -159,8 +248,7 @@ def discover_momentum_universe(
         if isinstance(s, str) and s.replace(".", "").isalnum() and len(s) <= 12
     ]
 
-    if trading_client is not None and symbols:
-        symbols = _filter_tradable(trading_client, symbols)
+    symbols, excluded = _filter_instruments(trading_client, symbols)
 
     symbols = symbols[:max_symbols]
     if not symbols:
@@ -172,4 +260,5 @@ def discover_momentum_universe(
         as_of=last_updated or now,
         is_fallback=False,
         warning=None,
+        excluded_instruments_count=excluded,
     )
