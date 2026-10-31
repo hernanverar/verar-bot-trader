@@ -64,6 +64,22 @@ type HotStock = {
   as_of: string | null;
 };
 
+type PullbackPattern = {
+  symbol: string;
+  state: "impulse_detected" | "pullback_in_progress" | "recovery_confirmed" | "invalidated";
+  impulse_start_ts: string;
+  impulse_high_ts: string;
+  impulse_low: number;
+  impulse_high: number;
+  impulse_gain_pct: number;
+  pullback_low: number | null;
+  pullback_low_ts: string | null;
+  retracement_pct: number | null;
+  pullback_bars: number | null;
+  recovery_ts: string | null;
+  invalidation_reason: string | null;
+};
+
 type ScanMeta = {
   universe: string[];
   total_scanned: number;
@@ -126,6 +142,11 @@ export default function Home() {
   const [eligibleOnly, setEligibleOnly] = useState(false);
   const [scanMode, setScanMode] = useState<"auto" | "manual">("auto");
   const [manualSymbols, setManualSymbols] = useState("");
+  const [pbSymbol, setPbSymbol] = useState("");
+  const [pbPatterns, setPbPatterns] = useState<PullbackPattern[] | null>(null);
+  const [pbLoading, setPbLoading] = useState(false);
+  const [pbError, setPbError] = useState("");
+  const [pbMeta, setPbMeta] = useState<{ bars: number; count: number } | null>(null);
 
   async function runBacktest() {
     setLoading(true);
@@ -208,6 +229,41 @@ export default function Home() {
       );
     } finally {
       setScanLoading(false);
+    }
+  }
+
+  async function runPullbackScan() {
+    const symbol = pbSymbol.trim().toUpperCase();
+    if (!symbol) {
+      setPbError("Select or enter a symbol.");
+      return;
+    }
+    setPbLoading(true);
+    setPbError("");
+
+    try {
+      const response = await fetch(
+        `/api/strategies/pullbacks?symbol=${encodeURIComponent(symbol)}`,
+      );
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : data.error || "Pullback analysis failed",
+        );
+      }
+
+      setPbPatterns(data.patterns ?? []);
+      setPbMeta({
+        bars: data.bars_analyzed ?? 0,
+        count: data.patterns_found ?? 0,
+      });
+    } catch (err) {
+      setPbError(err instanceof Error ? err.message : "Unexpected error");
+    } finally {
+      setPbLoading(false);
     }
   }
 
@@ -776,6 +832,124 @@ export default function Home() {
             </section>
           </>
         )}
+
+        <section className="rounded-2xl border border-white/10 bg-[#111b2d] p-6">
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h3 className="text-lg font-semibold">Pullback Research</h3>
+              <p className="text-sm text-slate-400">
+                Deterministic impulse → pullback → recovery detection on
+                1-minute bars. Research only — no trade signals.
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <select
+                value={pbSymbol}
+                onChange={(e) => setPbSymbol(e.target.value)}
+                className="rounded-lg border border-white/10 bg-[#080d17] px-3 py-2 text-xs outline-none focus:border-blue-500"
+              >
+                <option value="">Select symbol…</option>
+                {(hotStocks ?? []).map((s) => (
+                  <option key={s.symbol} value={s.symbol}>
+                    {s.symbol}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="text"
+                value={pbSymbol}
+                onChange={(e) => setPbSymbol(e.target.value.toUpperCase())}
+                placeholder="or type symbol"
+                className="w-32 rounded-lg border border-white/10 bg-[#080d17] px-3 py-2 text-xs outline-none focus:border-blue-500"
+              />
+              <button
+                onClick={runPullbackScan}
+                disabled={pbLoading}
+                className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold transition hover:bg-blue-500 disabled:opacity-50"
+              >
+                {pbLoading ? (
+                  <LoaderCircle className="animate-spin" size={16} />
+                ) : (
+                  <BarChart3 size={16} />
+                )}
+                {pbLoading ? "Analyzing..." : "Analyze"}
+              </button>
+            </div>
+          </div>
+
+          {pbError && (
+            <p role="alert" className="mb-4 text-sm text-red-400">
+              {pbError}
+            </p>
+          )}
+
+          {pbPatterns === null ? (
+            <p className="py-6 text-center text-sm text-slate-500">
+              Choose a symbol to analyze recent 1-minute bars for pullback
+              patterns.
+            </p>
+          ) : pbPatterns.length === 0 ? (
+            <p className="py-6 text-center text-sm text-slate-500">
+              No pullback patterns detected in {pbMeta?.bars ?? 0} bars
+              analyzed.
+            </p>
+          ) : (
+            <>
+              <p className="mb-4 text-xs text-slate-400">
+                {pbMeta?.count} pattern
+                {pbMeta?.count === 1 ? "" : "s"} in {pbMeta?.bars} bars
+                analyzed
+              </p>
+              <div className="space-y-3">
+                {pbPatterns.map((p, i) => (
+                  <div
+                    key={`${p.impulse_start_ts}-${i}`}
+                    className="rounded-xl border border-white/10 bg-[#0d1422] p-4 text-xs"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold">{p.symbol}</span>
+                      <span
+                        className={`rounded-full border px-2 py-0.5 font-medium ${
+                          p.state === "recovery_confirmed"
+                            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                            : p.state === "invalidated"
+                              ? "border-red-500/30 bg-red-500/10 text-red-400"
+                              : "border-blue-500/30 bg-blue-500/10 text-blue-400"
+                        }`}
+                      >
+                        {p.state.replace(/_/g, " ")}
+                      </span>
+                    </div>
+                    <div className="mt-2 grid gap-1 text-slate-400 sm:grid-cols-2">
+                      <span>
+                        Impulse: {p.impulse_low.toFixed(2)} →{" "}
+                        {p.impulse_high.toFixed(2)} (
+                        {p.impulse_gain_pct.toFixed(1)}%)
+                      </span>
+                      <span>
+                        Retracement:{" "}
+                        {p.retracement_pct !== null
+                          ? `${p.retracement_pct.toFixed(1)}%`
+                          : "n/a"}
+                        {p.pullback_low !== null &&
+                          ` (low ${p.pullback_low.toFixed(2)})`}
+                      </span>
+                      <span>
+                        Impulse: {new Date(p.impulse_start_ts).toLocaleTimeString()}{" "}
+                        → {new Date(p.impulse_high_ts).toLocaleTimeString()}
+                      </span>
+                      <span>
+                        {p.recovery_ts
+                          ? `Confirmed ${new Date(p.recovery_ts).toLocaleTimeString()}`
+                          : p.invalidation_reason ?? "awaiting recovery"}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
 
         <footer className="border-t border-white/10 pt-6 text-xs text-slate-500">
           VERAR BOT TRADER · Historical research only · No live

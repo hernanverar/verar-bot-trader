@@ -91,3 +91,26 @@ def session_cum_volume_at(day_bars: list, cutoff: dtime, tz=MARKET_TZ) -> float:
         for b in day_bars
         if b.timestamp.astimezone(tz).time() <= cutoff
     )
+
+
+def filter_regular_session_bars(
+    bars: list,
+    session_times: dict[date, tuple[dtime, dtime]],
+    tz=MARKET_TZ,
+) -> list:
+    """Keep only bars inside each day's official regular session.
+
+    `session_times` maps session date -> (open, close) from the exchange
+    calendar (early closes included). Bars whose session date is absent
+    from the map are dropped — unverified sessions are never guessed.
+
+    Used by pullback-pattern prep; NOT applied in fetch_minute_bars so
+    other features can still use extended-hours data.
+    """
+    kept = []
+    for b in bars:
+        ts_et = b.timestamp.astimezone(tz)
+        times = session_times.get(ts_et.date())
+        if times is not None and times[0] <= ts_et.time() < times[1]:
+            kept.append(b)
+    return kept

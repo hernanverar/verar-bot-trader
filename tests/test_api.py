@@ -241,6 +241,41 @@ def test_hot_stocks_rejects_unknown_mode():
     assert response.status_code == 422
 
 
+def test_pullbacks_endpoint_returns_patterns():
+    from types import SimpleNamespace
+
+    fake_bar = SimpleNamespace(
+        symbol="AAPL", timestamp=datetime(2026, 1, 15, 14, 30, tzinfo=timezone.utc),
+        open=100.0, high=100.5, low=99.9, close=100.4, volume=1000,
+    )
+    with (
+        patch("app.api.main.get_data_client", return_value=object()),
+        patch("app.api.main.fetch_minute_bars", return_value={"AAPL": [fake_bar]}),
+        patch("app.api.main.get_trading_client", return_value=object()),
+        patch("app.api.main._fetch_trading_days",
+              return_value={fake_bar.timestamp.date(): (datetime(2026,1,15,9,30).time(), datetime(2026,1,15,16,0).time())}),
+        patch("app.api.main.detect_pullbacks") as detect,
+    ):
+        detect.return_value = []
+        response = client.get("/api/strategies/pullbacks?symbol=aapl")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["symbol"] == "AAPL"
+    assert data["session_verified"] is True
+    assert data["bars_analyzed"] == 1
+    assert data["patterns_found"] == 0
+    assert "as_of" in data
+    detect.assert_called_once()
+
+
+def test_pullbacks_validation():
+    assert client.get("/api/strategies/pullbacks?symbol=AAPL&retrace_min=0.8&retrace_max=0.2").status_code == 422
+    assert client.get("/api/strategies/pullbacks?symbol=***").status_code == 422
+    assert client.get("/api/strategies/pullbacks?symbol=AAPL&impulse_min_bars=50&impulse_max_bars=10").status_code == 422
+    assert client.get("/api/strategies/pullbacks").status_code == 422  # symbol required
+
+
 def test_auto_mode_accepts_alpaca_symbol_formats():
     """Regression: discovered tickers like BRK.B must not trip the
     manual-input 'Invalid symbols list' validation."""
