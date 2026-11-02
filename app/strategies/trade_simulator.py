@@ -35,6 +35,7 @@ class TradeConfig:
     stop_loss_pct: float = 5.0
     profit_target_pct: float = 15.0
     risk_reward: float | None = None  # when set with stop_overrides: target = entry + rr*risk
+    require_contiguous_entry: bool = False  # entry bar must be the N+1 minute
     entry_slippage_bps: float = 5.0
     exit_slippage_bps: float = 5.0
     commission_per_trade: float = 0.0
@@ -147,6 +148,13 @@ def simulate_pullback_trades(
         seg_end = _segment_end(bars, rec_idx, config.max_gap_minutes)
         if entry_idx > seg_end:
             skipped.append((pattern.recovery_ts, "no next regular-session bar"))
+            continue
+        if config.require_contiguous_entry and (
+            entry_bar.timestamp - pattern.recovery_ts
+        ).total_seconds() != 60:
+            skipped.append(
+                (pattern.recovery_ts, "skipped_entry_gap")
+            )
             continue
         entry = entry_bar.open * (1 + slip_in)
         stop = (stop_overrides or {}).get(

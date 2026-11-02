@@ -288,3 +288,84 @@ def test_lifecycle_mapping():
     assert lifecycle_status(ts, sim) == "unresolved_data_end"
     sim.trades = [NS(recovery_ts=ts)]
     assert lifecycle_status(ts, sim) == "simulated_filled"
+
+
+def test_contiguous_entry_exact_n_plus_1():
+    """N+1 contiguous bar -> entry allowed."""
+    from app.strategies.trade_simulator import TradeConfig
+    bars = setup_bars()
+    setups, _ = detect_momentum_setups(bars, CFG, "EVGO")
+    r = simulate_momentum_setups(
+        bars, setups, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0,
+                                  commission_per_trade=0, risk_reward=2.0,
+                                  require_contiguous_entry=True))
+    assert len(r.unresolved) == 1
+    assert r.unresolved[0].entry_ts == bars[6].timestamp
+
+
+def test_missing_n_plus_1_skips_entry_gap():
+    """Confirm at N, next observed bar at N+3 -> skipped_entry_gap."""
+    from app.strategies.trade_simulator import TradeConfig
+    bars = setup_bars()
+    del bars[6]  # remove the N+1 bar; next observed is N+2
+    setups, _ = detect_momentum_setups(bars, CFG, "EVGO")
+    r = simulate_momentum_setups(
+        bars, setups, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0,
+                                  commission_per_trade=0, risk_reward=2.0,
+                                  require_contiguous_entry=True))
+    assert r.trades == () and r.unresolved == ()
+    assert any(reason == "skipped_entry_gap" for _, reason in r.skipped)
+
+
+def test_legacy_sim_without_flag_allows_gap_entry():
+    """Default (no contiguous requirement) preserves legacy behavior."""
+    from app.strategies.trade_simulator import TradeConfig
+    bars = setup_bars()
+    del bars[6]
+    setups, _ = detect_momentum_setups(bars, CFG, "EVGO")
+    r = simulate_momentum_setups(
+        bars, setups, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0,
+                                  commission_per_trade=0, risk_reward=2.0))
+    assert len(r.unresolved) == 1   # gap-tolerant legacy entry filled
+
+
+def test_lifecycle_entry_gap_mapping():
+    from types import SimpleNamespace as NS
+    from app.strategies.momentum_simulator import lifecycle_status
+    ts = DAY + timedelta(minutes=1)
+    sim = NS(trades=[], unresolved=[], skipped=[(ts, "skipped_entry_gap")])
+    assert lifecycle_status(ts, sim) == "skipped_entry_gap"
+
+
+def test_contiguous_entry_same_rth_session():
+    """A 60s gap that crosses a session boundary can't exist in RTH-filtered
+    input, but confirm the rule can't bridge sessions: confirm at 15:59 and
+    next bar at 16:00 of the SAME day is the only 60s adjacency possible —
+    an overnight 60s-looking adjacency cannot occur (next day opens hours
+    later). Verify a session-boundary confirm is skipped."""
+    from app.strategies.trade_simulator import TradeConfig
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+    ET2 = ZoneInfo("America/New_York")
+    close_bar = SimpleNamespace(
+        timestamp=datetime(2026,1,15,15,59,tzinfo=ET2),
+        open=2.0, high=2.05, low=1.95, close=2.04, volume=5000)
+    next_day = SimpleNamespace(
+        timestamp=datetime(2026,1,16,9,30,tzinfo=ET2),
+        open=2.1, high=2.12, low=2.05, close=2.1, volume=500)
+    # Fabricate: confirm pattern whose recovery_ts is 15:59 — next observed
+    # bar is next-day 9:30 (huge delta) -> NOT 60s -> skipped_entry_gap
+    from app.strategies.momentum_detector import MomentumSetup
+    fake = MomentumSetup(symbol="X", impulse_anchor_ts=close_bar.timestamp,
+                         impulse_high=2.05, anchor_low=1.9, pullback_low=1.95,
+                         pullback_bars=2, confirm_ts=close_bar.timestamp,
+                         confirm_price=2.04, confirm_volume=5000,
+                         stop_price=1.95, pending_entry=True)
+    r = simulate_momentum_setups(
+        [close_bar, next_day], [fake],
+        TradeConfig(require_contiguous_entry=True, risk_reward=2.0,
+                    entry_slippage_bps=0, exit_slippage_bps=0))
+    # No fill may cross a session boundary — blocked by seg_end or the 60s rule
+    assert r.trades == () and r.unresolved == ()
+    assert len(r.skipped) == 1
+    assert "gap" in r.skipped[0][1] or "no next" in r.skipped[0][1]

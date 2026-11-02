@@ -107,7 +107,9 @@ def main() -> None:
 
         setups, rejected = detect_momentum_setups(bars, symbol=c.symbol)
         sim = simulate_momentum_setups(
-            bars, setups, TradeConfig(risk_reward=2.0), session_times=td)
+            bars, setups,
+            TradeConfig(risk_reward=2.0, require_contiguous_entry=True),
+            session_times=td)
         result = {
             "symbol": c.symbol, "session": c.session_date,
             "tier": c.tier,
@@ -120,6 +122,7 @@ def main() -> None:
                 "entry_slippage_bps": 5.0, "exit_slippage_bps": 5.0,
                 "commission": 0.0, "risk_reward": 2.0,
                 "entry_rule": "next_completed_bar_open",
+                "require_contiguous_entry": True,
             },
             "confirmed": len(setups),
             "rejected_by_reason": {
