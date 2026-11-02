@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from alpaca.common.exceptions import APIError
 import re
 import threading
+import time
 from datetime import time as dt_time
 from fastapi import Body, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -19,6 +20,7 @@ from app.strategies.pullback_detector import PullbackConfig, detect_pullbacks
 from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
 from app.chart_data import rth_vwap, session_vwap
 from app import alert_store
+from app.diagnostics import record as _diag, session_report as _session_report
 from app.alerts import AlertEvent, VALID_TYPES, evaluate_alert, new_alert, rearm
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -280,8 +282,10 @@ def chart_bars(
     try:
         client = get_data_client()
     except RuntimeError as exc:
+        _diag("alpaca_error", context="chart_bars", symbol=symbol, error=str(exc)[:200])
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    t0 = time.monotonic()
     try:
         result = client.get_stock_bars(
             StockBarsRequest(
@@ -294,7 +298,12 @@ def chart_bars(
         )
         raw = result.data.get(symbol, [])
     except APIError as exc:
+        _diag("alpaca_error", context="chart_bars", symbol=symbol, error="upstream APIError")
+        _diag("chart_refresh", symbol=symbol, interval_min=interval, ok=False,
+              fetch_ms=round((time.monotonic() - t0) * 1000, 1),
+              error="Upstream market-data error")
         raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
+    fetch_ms = round((time.monotonic() - t0) * 1000, 1)
 
     # Completed bars only — never render an unfinished candle.
     now = datetime.now(timezone.utc)
@@ -321,6 +330,15 @@ def chart_bars(
         trading_client,
         (now - timedelta(days=days + 5)).date(),
         now.date(),
+    )
+
+    last_ts = complete[-1].timestamp if complete else None
+    _diag(
+        "chart_refresh", symbol=symbol, interval_min=interval, ok=True,
+        fetch_ms=fetch_ms, bars=len(bars),
+        last_data_ts=int(last_ts.timestamp()) if last_ts else None,
+        # bar-completion -> receipt, accounting for the bar's own duration
+        data_age_ms=round((now - (last_ts + step)).total_seconds() * 1000, 1) if last_ts else None,
     )
 
     return {
@@ -367,6 +385,8 @@ def pullback_simulation(
         raw = fetch_minute_bars(client, [symbol], days=days)
         bars = completed_minute_bars(raw.get(symbol, []))
     except APIError as exc:
+        _diag("alpaca_error", context="pullback_simulation", symbol=symbol,
+              error="upstream APIError")
         raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
 
     try:
@@ -391,7 +411,14 @@ def pullback_simulation(
         stop_loss_pct=stop_loss_pct,
         profit_target_pct=profit_target_pct,
     )
+    t0 = time.monotonic()
     result = simulate_pullback_trades(bars, patterns, config, session_times=trading_days)
+    _diag("sim_run", symbol=symbol,
+          patterns_confirmed=result.patterns_confirmed,
+          trades_entered=len(result.trades),
+          unresolved=len(result.unresolved),
+          net_pnl=result.net_pnl, exit_reasons=result.exit_reasons,
+          duration_ms=round((time.monotonic() - t0) * 1000, 1))
 
     return {
         "symbol": symbol,
@@ -545,7 +572,10 @@ _eval_lock = threading.Lock()
 @app.post("/api/alerts/evaluate")
 def evaluate_alerts():
     if not _eval_lock.acquire(blocking=False):
+        _diag("alert_eval", alerts_evaluated=0, busy=True, skipped_symbols=[],
+              monitored_symbols=0, new_events=0, duration_ms=None)
         return {"new_events": [], "alerts_evaluated": 0, "busy": True}
+    t_eval = time.monotonic()
     try:
         return _evaluate_alerts_locked()
     finally:
@@ -610,6 +640,12 @@ def _evaluate_alerts_locked():
                 a.state["last_ts"] = a.state["last_ts"] if isinstance(a.state["last_ts"], str) else a.state["last_ts"].isoformat()
             if a.state.get("session_day") and not isinstance(a.state["session_day"], str):
                 a.state["session_day"] = a.state["session_day"].isoformat()
+            for e in evs:
+                _diag("alert_triggered", alert_id=a.id, symbol=a.symbol,
+                      alert_type=a.alert_type, bar_ts=e.ts.isoformat(),
+                      eval_ts=now.isoformat(),
+                      alert_latency_ms=round((now - e.ts).total_seconds() * 1000, 1),
+                      trigger_price=e.trigger_price)
             new_events.extend(e.to_dict() for e in evs)
 
     def _mut(store_alerts, events):
@@ -617,6 +653,10 @@ def _evaluate_alerts_locked():
         for i, a in enumerate(store_alerts):
             if a.id in by_id:
                 store_alerts[i] = by_id[a.id]
+        _diag("alert_eval", alerts_evaluated=len(alerts),
+              monitored_symbols=len(symbols), skipped_symbols=skipped_symbols,
+              new_events=len(new_events), busy=False,
+              duration_ms=round((time.monotonic() - t_eval) * 1000, 1))
         return {
             "new_events": new_events,
             "alerts_evaluated": len(alerts),
@@ -625,3 +665,46 @@ def _evaluate_alerts_locked():
         }, store_alerts, events + [AlertEvent.from_dict(e) for e in new_events]
 
     return alert_store.mutate(_mut)
+
+
+# ---- Phase 2D: session diagnostics (local-only) -------------------------
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+@app.get("/api/diagnostics/session")
+def diagnostics_session(date: str = Query(...)):
+    """Aggregated local validation report for one ET session date."""
+    if not _DATE_RE.match(date):
+        raise HTTPException(422, "date must be YYYY-MM-DD")
+    day = datetime.strptime(date, "%Y-%m-%d").date()
+    try:
+        trading_client = get_trading_client()
+        cal = _fetch_trading_days(trading_client, day, day)
+    except Exception:
+        cal = None
+    return _session_report(day, (cal or {}).get(day))
+
+
+@app.post("/api/diagnostics/client")
+def diagnostics_client(body: dict = Body(...)):
+    """Record a browser-reported event (e.g., notification attempt).
+
+    Client-submitted data is labeled browser-reported and never treated
+    as server-verified. Schema-constrained; timestamps are validated.
+    """
+    kind = body.get("kind")
+    valid = {"notification_attempt", "notification_failed",
+             "notification_denied", "notifications_unsupported"}
+    if kind not in valid:
+        raise HTTPException(422, "unsupported client event kind")
+    reported = body.get("reported_at")
+    if reported is not None:
+        try:
+            datetime.fromisoformat(str(reported))
+        except ValueError:
+            raise HTTPException(422, "invalid reported_at")
+    _diag("client_event", client_kind=kind,
+          event_id=body.get("event_id"), symbol=body.get("symbol"),
+          reported_at=reported, detail=str(body.get("detail", ""))[:300])
+    return {"recorded": True, "verified": "browser-reported"}

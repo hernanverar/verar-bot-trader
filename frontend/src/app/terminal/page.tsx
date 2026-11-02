@@ -213,9 +213,25 @@ function TerminalInner() {
           for (const e of fresh) {
             if (!notifiedRef.current.has(e.id)) {
               notifiedRef.current.add(e.id);
-              new Notification(e.symbol, {
-                body: `${e.message} · ${ET_FULL.format(new Date(e.ts).getTime())}`,
-              });
+              let outcome = "notification_attempt";
+              try {
+                new Notification(e.symbol, {
+                  body: `${e.message} · ${ET_FULL.format(new Date(e.ts).getTime())}`,
+                });
+              } catch {
+                outcome = "notification_failed";
+              }
+              void fetch("/api/diagnostics/client", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  kind: outcome,
+                  event_id: e.id,
+                  symbol: e.symbol,
+                  reported_at: new Date().toISOString(),
+                  detail: e.message,
+                }),
+              }).catch(() => {});
             }
           }
         }
@@ -226,9 +242,20 @@ function TerminalInner() {
   }, [notifyOn, refreshAlerts]);
 
   const enableNotifications = async () => {
-    if (!("Notification" in window)) { setNotifyOn(false); return; }
+    const report = (kind: string) =>
+      void fetch("/api/diagnostics/client", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind, reported_at: new Date().toISOString() }),
+      }).catch(() => {});
+    if (!("Notification" in window)) {
+      report("notifications_unsupported");
+      setNotifyOn(false);
+      return;
+    }
     if (Notification.permission === "granted") { setNotifyOn(true); return; }
     const p = await Notification.requestPermission();
+    if (p !== "granted") report("notification_denied");
     setNotifyOn(p === "granted");
   };
 
