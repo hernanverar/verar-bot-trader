@@ -65,6 +65,28 @@ type AlertRec = {
   state: { fired?: boolean };
 };
 
+type SetupItem = {
+  id: string;
+  confirm_ts: string;
+  confirm_price: number;
+  impulse_high: number;
+  pullback_low: number;
+  stop_price: number;
+  pending_entry: boolean;
+  lifecycle?: string;
+};
+
+type SetupResp = {
+  status?: string;
+  reason?: string;
+  confirmed: SetupItem[];
+  rejected: { ts: string; reason: string }[];
+  trades: SimTrade[];
+  unresolved: SimTrade[];
+  bars_analyzed: number;
+  note: string;
+};
+
 type AlertEvt = {
   id: string;
   symbol: string;
@@ -152,6 +174,11 @@ function TerminalInner() {
   const [selectedTrade, setSelectedTrade] = useState<number | null>(null);
   const simInFlight = useRef(false);
   const [showRthVwap, setShowRthVwap] = useState(false);
+  // Momentum setups (Phase 3A)
+  const [setupData, setSetupData] = useState<SetupResp | null>(null);
+  const [setupLoading, setSetupLoading] = useState(false);
+  const [setupError, setSetupError] = useState("");
+  const setupInFlight = useRef(false);
 
   // ---- Alerts (Phase 2C) ----
   const [alerts, setAlerts] = useState<AlertRec[]>([]);
@@ -363,8 +390,15 @@ function TerminalInner() {
   );
   const outOfRange = trades.length - inRange.length;
 
-  const tradeMarks: TradeMark[] = inRange.flatMap((t) => {
-    const kind =
+  const setupMarks: TradeMark[] = (setupData?.confirmed ?? [])
+    .filter((s) => barTimes.has(epoch(s.confirm_ts)))
+    .map((s) => ({
+      time: epoch(s.confirm_ts),
+      kind: "setup" as const,
+      label: "SET",
+    }));
+  const tradeMarks: TradeMark[] = [...setupMarks, ...inRange.flatMap((t) => {
+    const kind: TradeMark["kind"] =
       t.exit_reason === "target" ? "exit_target"
       : t.exit_reason === "stop" ? "exit_stop"
       : t.exit_reason === "session_end" ? "exit_session"
@@ -373,7 +407,27 @@ function TerminalInner() {
       { time: epoch(t.entry_ts), kind: "entry" as const, label: "ENT" },
       { time: epoch(t.exit_ts), kind, label: t.exit_reason === "target" ? "TGT" : t.exit_reason === "stop" ? "STP" : "END" },
     ];
-  });
+  })];
+
+  async function scanSetups() {
+    if (setupInFlight.current) return;
+    setupInFlight.current = true;
+    setSetupLoading(true);
+    setSetupError("");
+    try {
+      const res = await fetch(
+        `/api/strategies/momentum-setups?symbol=${encodeURIComponent(symbol)}`,
+      );
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.detail || json.error || "Scan failed");
+      setSetupData(json);
+    } catch (err) {
+      setSetupError(err instanceof Error ? err.message : "Unexpected error");
+    } finally {
+      setupInFlight.current = false;
+      setSetupLoading(false);
+    }
+  }
 
   const sel = selectedTrade !== null ? inRange[selectedTrade] ?? null : null;
   const priceLines: PriceLine[] = sel
@@ -769,6 +823,63 @@ function TerminalInner() {
                   <li key={e.id} className="flex justify-between rounded border border-white/5 px-2 py-1">
                     <span>{e.message}</span>
                     <span className="text-slate-500">{ET_FULL.format(new Date(e.ts).getTime())}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-white/10 bg-[#111b2d] p-4 sm:p-6">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold">Momentum Setups</h3>
+              <p className="text-xs text-slate-500">
+                {setupData?.note ?? "Historical research — not live trade signals."}
+              </p>
+            </div>
+            <button
+              onClick={scanSetups}
+              disabled={setupLoading}
+              className="rounded-lg bg-cyan-600 px-4 py-1.5 text-xs font-semibold text-white transition hover:bg-cyan-500 disabled:opacity-50"
+            >
+              {setupLoading ? "Scanning…" : `Scan ${symbol}`}
+            </button>
+          </div>
+
+          {setupError && (
+            <p role="alert" className="mb-3 text-xs text-red-400">{setupError}</p>
+          )}
+
+          {setupData && setupData.status === "unavailable" && (
+            <p role="alert" className="mb-2 text-xs text-amber-400">
+              {setupData.reason}
+            </p>
+          )}
+
+          {setupData && setupData.status !== "unavailable" && (
+            <div className="text-xs text-slate-400">
+              <p>
+                {setupData.confirmed.length} confirmed ·{" "}
+                {setupData.trades.length} realized ·{" "}
+                {setupData.unresolved.length} unresolved ·{" "}
+                {setupData.bars_analyzed} RTH bars
+              </p>
+              {setupData.rejected.length > 0 && (
+                <p className="mt-1 text-slate-500">
+                  Rejected:{" "}
+                  {[...new Set(setupData.rejected.map((r) => r.reason))].join(", ")}
+                </p>
+              )}
+              <ul className="mt-2 space-y-1">
+                {setupData.confirmed.map((s) => (
+                  <li key={s.id} className="flex justify-between rounded border border-white/5 bg-[#0d1422] px-2 py-1">
+                    <span className="text-cyan-300">
+                      SET {ET_FULL.format(new Date(s.confirm_ts).getTime())} @ ${s.confirm_price.toFixed(2)}
+                    </span>
+                    <span className="text-slate-500">
+                      {s.lifecycle ?? (s.pending_entry ? "confirmed_pending_entry" : "simulated_filled")} · stop ${s.stop_price.toFixed(2)}
+                    </span>
                   </li>
                 ))}
               </ul>

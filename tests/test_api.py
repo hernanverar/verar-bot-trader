@@ -401,3 +401,54 @@ def test_evaluate_exception_records_api_error(monkeypatch):
     res = TestClient(app, raise_server_exceptions=False).post("/api/alerts/evaluate")
     assert res.status_code == 500
     assert "api_error" in records
+
+
+def test_momentum_setups_endpoint_invalid_symbol():
+    res = client.get("/api/strategies/momentum-setups?symbol=%20&days=1")
+    assert res.status_code == 422
+
+
+def test_momentum_setups_endpoint_structure(monkeypatch):
+    """Endpoint returns confirmed/rejected/sim config without Alpaca."""
+    import app.api.main as api_main
+    from types import SimpleNamespace
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    ET = ZoneInfo("America/New_York")
+    day = datetime(2026, 1, 15, 9, 30, tzinfo=ET)
+    bars = [
+        SimpleNamespace(timestamp=day + timedelta(minutes=i),
+                        open=2.0, high=2.02, low=1.98, close=2.0, volume=100)
+        for i in range(5)
+    ]
+    monkeypatch.setattr(api_main, "fetch_minute_bars",
+                        lambda c, syms, days: {"AMC": bars})
+    monkeypatch.setattr(api_main, "_fetch_trading_days",
+                        lambda c, a, b: {day.date(): (day.time(), day.time())})
+    monkeypatch.setattr(api_main, "get_data_client", lambda: object())
+    monkeypatch.setattr(api_main, "get_trading_client", lambda: object())
+    res = client.get("/api/strategies/momentum-setups?symbol=AMC&days=1")
+    assert res.status_code == 200
+    body = res.json()
+    for k in ("confirmed", "rejected", "trades", "unresolved", "config",
+              "session_verified", "feed", "note"):
+        assert k in body
+    assert body["session_verified"] is True
+
+
+def test_momentum_setups_fail_closed_no_calendar(monkeypatch):
+    """Unverifiable RTH calendar -> explicit unavailable, no bar analysis."""
+    import app.api.main as api_main
+    monkeypatch.setattr(api_main, "fetch_minute_bars",
+                        lambda c, syms, days: {"AMC": []})
+    monkeypatch.setattr(api_main, "_fetch_trading_days", lambda c, a, b: None)
+    monkeypatch.setattr(api_main, "get_data_client", lambda: object())
+    monkeypatch.setattr(api_main, "get_trading_client", lambda: object())
+    res = client.get("/api/strategies/momentum-setups?symbol=AMC&days=1")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "unavailable"
+    assert body["session_verified"] is False
+    assert body["confirmed"] == [] and body["bars_analyzed"] == 0
+    assert "fail-closed" in body["reason"]

@@ -28,7 +28,7 @@ export type VwapPoint = { time: number; value: number };
 
 export type TradeMark = {
   time: number;
-  kind: "entry" | "exit_target" | "exit_stop" | "exit_session" | "exit_other";
+  kind: "entry" | "exit_target" | "exit_stop" | "exit_session" | "exit_other" | "setup" | "setup_pending";
   label: string;
 };
 
@@ -132,6 +132,8 @@ const MARK_STYLE: Record<TradeMark["kind"], { color: string; position: "aboveBar
   exit_stop: { color: "#ef4444", position: "aboveBar", shape: "arrowDown" },
   exit_session: { color: "#94a3b8", position: "aboveBar", shape: "arrowDown" },
   exit_other: { color: "#f59e0b", position: "aboveBar", shape: "arrowDown" },
+  setup: { color: "#06b6d4", position: "belowBar", shape: "arrowUp" },
+  setup_pending: { color: "#a78bfa", position: "belowBar", shape: "arrowUp" },
 };
 
 /** Bars per ET session for initial viewport sizing. */

@@ -34,6 +34,7 @@ class TradeConfig:
     risk_pct: float = 0.01
     stop_loss_pct: float = 5.0
     profit_target_pct: float = 15.0
+    risk_reward: float | None = None  # when set with stop_overrides: target = entry + rr*risk
     entry_slippage_bps: float = 5.0
     exit_slippage_bps: float = 5.0
     commission_per_trade: float = 0.0
@@ -105,6 +106,7 @@ def simulate_pullback_trades(
     patterns: list[PullbackPattern],
     config: TradeConfig | None = None,
     session_times: dict | None = None,
+    stop_overrides: dict | None = None,
 ) -> SimulationResult:
     """Simulate trades for confirmed patterns over regular-session bars.
 
@@ -147,8 +149,18 @@ def simulate_pullback_trades(
             skipped.append((pattern.recovery_ts, "no next regular-session bar"))
             continue
         entry = entry_bar.open * (1 + slip_in)
-        stop = entry * (1 - config.stop_loss_pct / 100)
-        target = entry * (1 + config.profit_target_pct / 100)
+        stop = (stop_overrides or {}).get(
+            pattern.recovery_ts, entry * (1 - config.stop_loss_pct / 100)
+        )
+        if config.risk_reward is not None and pattern.recovery_ts in (stop_overrides or {}):
+            target = entry + config.risk_reward * (entry - stop)
+        else:
+            target = entry * (1 + config.profit_target_pct / 100)
+        if stop >= entry or target <= entry:
+            skipped.append(
+                (pattern.recovery_ts, "invalid risk geometry (stop/target nonpositive)")
+            )
+            continue
         risk_per_share = entry - stop
         budget = equity * config.risk_pct
 

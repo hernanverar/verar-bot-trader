@@ -19,6 +19,8 @@ from app.market_session import _fetch_trading_days
 from app.strategies.pullback_detector import PullbackConfig, detect_pullbacks
 from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
 from app.chart_data import rth_vwap, session_vwap
+from app.strategies.momentum_detector import MomentumSetupConfig, detect_momentum_setups
+from app.strategies.momentum_simulator import lifecycle_status, simulate_momentum_setups
 from app import alert_store
 from app.diagnostics import record as _diag, session_report as _session_report
 from app.alerts import AlertEvent, VALID_TYPES, evaluate_alert, new_alert, rearm
@@ -726,3 +728,118 @@ def diagnostics_client(body: dict = Body(...)):
           event_id=body.get("event_id"), symbol=body.get("symbol"),
           reported_at=reported, detail=str(body.get("detail", ""))[:300])
     return {"recorded": True, "verified": "browser-reported"}
+
+
+# ---- Phase 3A: momentum setups (read-only research) ----------------------
+
+@app.get("/api/strategies/momentum-setups")
+def momentum_setups(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    days: int = Query(default=5, ge=1, le=30),
+    target_r_multiple: float = Query(default=2.0, ge=0.5, le=10.0),
+):
+    """Detected Ross-style momentum setups + simulated outcomes.
+
+    Research only — completed RTH 1m bars, no orders, no live signals.
+    Historical scanner eligibility is NOT claimed unless reconstructable.
+    """
+    symbol = symbol.strip().upper()
+    if not symbol.replace(".", "").isalnum():
+        raise HTTPException(status_code=422, detail="Invalid symbol")
+
+    feed = _data_feed()
+    try:
+        data_client = get_data_client()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        raw = fetch_minute_bars(data_client, [symbol], days=days).get(symbol, [])
+    except APIError as exc:
+        _diag("alpaca_error", context="momentum_setups", symbol=symbol,
+              error="upstream APIError")
+        raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
+
+    trading_client = None
+    try:
+        trading_client = get_trading_client()
+    except RuntimeError:
+        pass
+    now = datetime.now(timezone.utc)
+    trading_days = _fetch_trading_days(
+        trading_client, (now - timedelta(days=days + 5)).date(), now.date()
+    )
+    session_verified = trading_days is not None
+    if not session_verified:
+        # Fail-closed: never analyze extended-hours/unverified bars.
+        return {
+            "symbol": symbol,
+            "as_of": now.isoformat(),
+            "status": "unavailable",
+            "reason": "RTH session calendar could not be verified — "
+                      "setups suppressed (fail-closed).",
+            "feed": feed.value if hasattr(feed, "value") else str(feed),
+            "session_verified": False,
+            "confirmed": [], "rejected": [], "trades": [],
+            "unresolved": [], "skipped": [],
+            "bars_analyzed": 0,
+            "note": "historical research — not live trade signals",
+        }
+    bars = filter_regular_session_bars(
+        completed_minute_bars(raw, now=now), trading_days
+    )
+
+    t0 = time.monotonic()
+    setups, rejected = detect_momentum_setups(bars, symbol=symbol)
+    sim = simulate_momentum_setups(
+        bars, setups,
+        TradeConfig(risk_reward=target_r_multiple),
+        session_times=trading_days,
+    )
+    _diag("sim_run", symbol=symbol, patterns_confirmed=len(setups),
+          trades_entered=len(sim.trades), unresolved=len(sim.unresolved),
+          net_pnl=sim.net_pnl, exit_reasons=sim.exit_reasons,
+          duration_ms=round((time.monotonic() - t0) * 1000, 1))
+
+    def _setup_id(s):
+        return f"{symbol}-{int(s.confirm_ts.timestamp())}"
+
+    return {
+        "symbol": symbol,
+        "as_of": now.isoformat(),
+        "feed": feed.value if hasattr(feed, "value") else str(feed),
+        "session_verified": session_verified,
+        "bars_analyzed": len(bars),
+        "note": "historical research — not live trade signals",
+        "config": {
+            "impulse_min_pct": MomentumSetupConfig().impulse_min_pct,
+            "pullback_max_retrace": MomentumSetupConfig().pullback_max_retrace,
+            "breakout_conf_vol_x": MomentumSetupConfig().breakout_conf_vol_x,
+            "target_r_multiple": target_r_multiple,
+        },
+        "status": "ok",
+        "confirmed": [
+            {
+                "id": _setup_id(s),
+                "lifecycle": lifecycle_status(s.confirm_ts, sim),
+                "confirm_ts": s.confirm_ts.isoformat(),
+                "confirm_price": s.confirm_price,
+                "impulse_high": s.impulse_high,
+                "anchor_low": s.anchor_low,
+                "pullback_low": s.pullback_low,
+                "pullback_bars": s.pullback_bars,
+                "stop_price": s.stop_price,
+                "pending_entry": s.pending_entry,
+            }
+            for s in setups
+        ],
+        "rejected": [
+            {"ts": r.ts.isoformat(), "reason": r.reason} for r in rejected
+        ],
+        "trades": [asdict(t) for t in sim.trades],
+        "unresolved": [asdict(t) for t in sim.unresolved],
+        "skipped": [[ts.isoformat(), r] for ts, r in sim.skipped],
+        "win_rate": sim.win_rate,
+        "net_pnl": sim.net_pnl,
+        "ending_equity": sim.ending_equity,
+        "exit_reasons": sim.exit_reasons,
+    }
