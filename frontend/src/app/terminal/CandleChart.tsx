@@ -5,10 +5,12 @@ import {
   CandlestickSeries,
   ColorType,
   HistogramSeries,
+  LineSeries,
   TickMarkType,
   createChart,
   createSeriesMarkers,
   type IChartApi,
+  type ISeriesApi,
   type SeriesMarker,
   type UTCTimestamp,
 } from "lightweight-charts";
@@ -22,10 +24,7 @@ export type OhlcvBar = {
   volume: number;
 };
 
-// ---- America/New_York handling -------------------------------------------
-// All tick labels and tooltip times are formatted through Intl with an
-// explicit ET timezone, so EST<->EDT transitions are handled automatically
-// and labels are correct regardless of the browser's timezone.
+export type VwapPoint = { time: number; value: number };
 
 const ET_TIME = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York",
@@ -96,14 +95,50 @@ const CHART_OPTIONS = {
   },
 } as const;
 
-/** Candles on pane 0 (~75%) + volume on a dedicated lower pane (~25%),
- * sharing the chart's single time axis — zoom/scroll stay synchronized.
- * Future layers (VWAP, MAs, entry/stop lines, alert markers) attach as
- * additional series on pane 0. */
-export default function CandleChart({ bars }: { bars: OhlcvBar[] }) {
+const toUtc = (t: number) => t as UTCTimestamp;
+
+function sessionMarkers(bars: OhlcvBar[]): SeriesMarker<UTCTimestamp>[] {
+  const markers: SeriesMarker<UTCTimestamp>[] = [];
+  let prev: Session | null = null;
+  for (const b of bars) {
+    const s = sessionOf(b.time);
+    if (s !== prev) {
+      if (s === "regular") {
+        markers.push({ time: toUtc(b.time), position: "belowBar", color: "#3b82f6", shape: "circle", text: "RTH", size: 0.5 });
+      } else if (s === "post" && prev === "regular") {
+        markers.push({ time: toUtc(b.time), position: "belowBar", color: "#f59e0b", shape: "circle", text: "AH", size: 0.5 });
+      }
+      prev = s;
+    }
+  }
+  return markers;
+}
+
+/** Candles + VWAP on pane 0, volume on a dedicated lower pane (~25%),
+ * sharing the chart's single time axis. Incremental refreshes append
+ * via series.update() so zoom/scroll are preserved; full reloads happen
+ * only on symbol/interval changes. */
+export default function CandleChart({
+  bars,
+  vwap = [],
+  showVwap = false,
+}: {
+  bars: OhlcvBar[];
+  vwap?: VwapPoint[];
+  showVwap?: boolean;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const seriesRef = useRef<{
+    candles: ISeriesApi<"Candlestick"> | null;
+    volume: ISeriesApi<"Histogram"> | null;
+    vwap: ISeriesApi<"Line"> | null;
+    lastBar: OhlcvBar | null;
+    lastVwap: VwapPoint | null;
+  }>({ candles: null, volume: null, vwap: null, lastBar: null, lastVwap: null });
+  const firstBarTimeRef = useRef<number | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
 
+  // Build chart + series once.
   useEffect(() => {
     if (!containerRef.current) return;
     const chart = createChart(containerRef.current, CHART_OPTIONS);
@@ -111,94 +146,95 @@ export default function CandleChart({ bars }: { bars: OhlcvBar[] }) {
 
     const candles = chart.addSeries(
       CandlestickSeries,
-      {
-        upColor: "#22c55e",
-        downColor: "#ef4444",
-        wickUpColor: "#22c55e",
-        wickDownColor: "#ef4444",
-        borderVisible: false,
-      },
+      { upColor: "#22c55e", downColor: "#ef4444", wickUpColor: "#22c55e", wickDownColor: "#ef4444", borderVisible: false },
       0,
     );
-
+    const vwapLine = chart.addSeries(
+      LineSeries,
+      { color: "#f59e0b", lineWidth: 1, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: true },
+      0,
+    );
     const volumePane = chart.addPane();
     volumePane.setStretchFactor(0.25);
     chart.panes()[0].setStretchFactor(0.75);
-    const volume = chart.addSeries(
-      HistogramSeries,
-      { priceFormat: { type: "volume" } },
-      1,
-    );
+    const volume = chart.addSeries(HistogramSeries, { priceFormat: { type: "volume" } }, 1);
 
-    const toUtc = (t: number) => t as UTCTimestamp;
-    candles.setData(
-      bars.map((b) => ({
-        time: toUtc(b.time),
-        open: b.open,
-        high: b.high,
-        low: b.low,
-        close: b.close,
-      })),
-    );
-
-    // Session-aware volume: green/red inside regular hours, muted in
-    // extended hours — direction is preserved, session is visible.
-    volume.setData(
-      bars.map((b) => {
-        const regular = sessionOf(b.time) === "regular";
-        const up = b.close >= b.open;
-        return {
-          time: toUtc(b.time),
-          value: b.volume,
-          color: up
-            ? regular
-              ? "rgba(34,197,94,0.5)"
-              : "rgba(34,197,94,0.22)"
-            : regular
-              ? "rgba(239,68,68,0.5)"
-              : "rgba(239,68,68,0.22)",
-        };
-      }),
-    );
-
-    // Session boundary markers — placed where the data itself transitions,
-    // so nothing is marked for sessions the feed did not report.
-    const markers: SeriesMarker<UTCTimestamp>[] = [];
-    let prev: Session | null = null;
-    for (const b of bars) {
-      const s = sessionOf(b.time);
-      if (s !== prev) {
-        if (s === "regular") {
-          markers.push({
-            time: toUtc(b.time),
-            position: "belowBar",
-            color: "#3b82f6",
-            shape: "circle",
-            text: "RTH",
-            size: 0.5,
-          });
-        } else if (s === "post" && prev === "regular") {
-          markers.push({
-            time: toUtc(b.time),
-            position: "belowBar",
-            color: "#f59e0b",
-            shape: "circle",
-            text: "AH",
-            size: 0.5,
-          });
-        }
-        prev = s;
-      }
-    }
-    createSeriesMarkers(candles, markers);
-
-    chart.timeScale().fitContent();
+    seriesRef.current = { candles, volume, vwap: vwapLine, lastBar: null, lastVwap: null };
+    createSeriesMarkers(candles, []);
 
     return () => {
       chart.remove();
       chartRef.current = null;
+      seriesRef.current = { candles: null, volume: null, vwap: null, lastBar: null, lastVwap: null };
     };
+  }, []);
+
+  const volumePoint = (b: OhlcvBar) => ({
+    time: toUtc(b.time),
+    value: b.volume,
+    color:
+      b.close >= b.open
+        ? sessionOf(b.time) === "regular"
+          ? "rgba(34,197,94,0.5)"
+          : "rgba(34,197,94,0.22)"
+        : sessionOf(b.time) === "regular"
+          ? "rgba(239,68,68,0.5)"
+          : "rgba(239,68,68,0.22)",
+  });
+
+  // Data updates — incremental append when possible, full reset on
+  // symbol/interval change so stale candles never linger.
+  useEffect(() => {
+    const { candles, volume, vwap: vwapSeries, lastBar, lastVwap } = seriesRef.current;
+    if (!candles || !volume || !vwapSeries) return;
+
+    const isAppend =
+      lastBar !== null &&
+      firstBarTimeRef.current !== null &&
+      bars.length > 0 &&
+      bars[0].time === firstBarTimeRef.current &&
+      bars[bars.length - 1].time >= lastBar.time;
+
+    if (isAppend) {
+      for (const b of bars) {
+        if (b.time >= lastBar!.time) {
+          candles.update({ time: toUtc(b.time), open: b.open, high: b.high, low: b.low, close: b.close });
+          volume.update(volumePoint(b));
+        }
+      }
+      const nv = vwap[vwap.length - 1];
+      if (nv && (!lastVwap || nv.time >= lastVwap.time)) {
+        vwapSeries.update({ time: toUtc(nv.time), value: nv.value });
+        seriesRef.current.lastVwap = nv;
+      }
+      seriesRef.current.lastBar = bars[bars.length - 1];
+      return;
+    }
+
+    // Full reset path.
+    candles.setData(
+      bars.map((b) => ({ time: toUtc(b.time), open: b.open, high: b.high, low: b.low, close: b.close })),
+    );
+    volume.setData(bars.map(volumePoint));
+    vwapSeries.setData(vwap.map((p) => ({ time: toUtc(p.time), value: p.value })));
+    seriesRef.current.lastBar = bars[bars.length - 1] ?? null;
+    seriesRef.current.lastVwap = vwap[vwap.length - 1] ?? null;
+    firstBarTimeRef.current = bars[0]?.time ?? null;
+    if (bars.length > 0) {
+      chartRef.current?.timeScale().fitContent();
+    }
+  }, [bars, vwap]);
+
+  // Re-render markers whenever the bar set changes materially.
+  useEffect(() => {
+    const { candles } = seriesRef.current;
+    if (candles) createSeriesMarkers(candles, sessionMarkers(bars));
   }, [bars]);
+
+  // VWAP visibility toggle.
+  useEffect(() => {
+    seriesRef.current.vwap?.applyOptions({ visible: showVwap });
+  }, [showVwap]);
 
   return <div ref={containerRef} className="h-[480px] w-full" />;
 }

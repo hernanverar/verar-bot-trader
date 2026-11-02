@@ -14,6 +14,7 @@ from app.market_data import _data_feed, get_data_client
 from app.market_session import _fetch_trading_days
 from app.strategies.pullback_detector import PullbackConfig, detect_pullbacks
 from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
+from app.chart_data import session_vwap
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from app.strategies.hot_stock_scanner import ScannerConfig, scan_hot_stocks
@@ -293,6 +294,7 @@ def chart_bars(
     # Completed bars only — never render an unfinished candle.
     now = datetime.now(timezone.utc)
     step = timedelta(minutes=interval)
+    complete = [b for b in raw if b.timestamp + step <= now]
     bars = [
         {
             "time": int(b.timestamp.timestamp()),
@@ -302,15 +304,27 @@ def chart_bars(
             "close": b.close,
             "volume": b.volume,
         }
-        for b in raw
-        if b.timestamp + step <= now
+        for b in complete
     ]
+
+    try:
+        trading_client = get_trading_client()
+    except RuntimeError:
+        trading_client = None
+    session_info = get_market_session(now=now, trading_client=trading_client)
 
     return {
         "symbol": symbol,
         "interval_min": interval,
         "feed": feed.value if hasattr(feed, "value") else str(feed),
         "as_of": now.isoformat(),
+        "market_session": session_info.session,
+        "market_is_open": session_info.is_open,
+        "last_data_ts": int(complete[-1].timestamp.timestamp()) if complete else None,
+        "vwap": [
+            {"time": int(ts.timestamp()), "value": round(v, 4)}
+            for ts, v in session_vwap(complete)
+        ],
         "bars": bars,
     }
 
