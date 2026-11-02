@@ -10,9 +10,12 @@ from app.market_data import DEFAULT_SYMBOLS
 from app.market_discovery import discover_momentum_universe, get_trading_client
 from app.market_session import get_market_session
 from app.intraday_data import completed_minute_bars, fetch_minute_bars, filter_regular_session_bars
-from app.market_data import get_data_client
+from app.market_data import _data_feed, get_data_client
 from app.market_session import _fetch_trading_days
 from app.strategies.pullback_detector import PullbackConfig, detect_pullbacks
+from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from app.strategies.hot_stock_scanner import ScannerConfig, scan_hot_stocks
 
 app = FastAPI(
@@ -247,4 +250,139 @@ def pullback_scan(
         "bars_analyzed": len(bars),
         "patterns_found": len(patterns),
         "patterns": [asdict(p) for p in patterns],
+    }
+
+
+@app.get("/api/charts/bars")
+def chart_bars(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    interval: int = Query(default=1, ge=1, le=60),
+    days: int = Query(default=5, ge=1, le=30),
+):
+    """OHLCV bars for the terminal chart. Read-only market data.
+
+    IEX feed caveat: not consolidated tape — volume understates the full
+    market. Response carries the feed label so the UI can disclose it.
+    """
+    symbol = symbol.strip().upper()
+    if not symbol.replace(".", "").isalnum():
+        raise HTTPException(status_code=422, detail="Invalid symbol")
+    if interval not in (1, 5, 15):
+        raise HTTPException(status_code=422, detail="interval must be 1, 5 or 15 minutes")
+
+    feed = _data_feed()
+    try:
+        client = get_data_client()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        result = client.get_stock_bars(
+            StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame(interval, TimeFrameUnit.Minute),
+                start=datetime.now(timezone.utc) - timedelta(days=days + 3),
+                feed=feed,
+                sort="asc",
+            )
+        )
+        raw = result.data.get(symbol, [])
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
+
+    # Completed bars only — never render an unfinished candle.
+    now = datetime.now(timezone.utc)
+    step = timedelta(minutes=interval)
+    bars = [
+        {
+            "time": int(b.timestamp.timestamp()),
+            "open": b.open,
+            "high": b.high,
+            "low": b.low,
+            "close": b.close,
+            "volume": b.volume,
+        }
+        for b in raw
+        if b.timestamp + step <= now
+    ]
+
+    return {
+        "symbol": symbol,
+        "interval_min": interval,
+        "feed": feed.value if hasattr(feed, "value") else str(feed),
+        "as_of": now.isoformat(),
+        "bars": bars,
+    }
+
+
+@app.get("/api/strategies/pullback-simulation")
+def pullback_simulation(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    profit_target_pct: float = Query(default=15.0, ge=1.0, le=100.0),
+    stop_loss_pct: float = Query(default=5.0, ge=0.1, le=50.0),
+    risk_pct: float = Query(default=0.01, gt=0, le=0.25),
+    initial_equity: float = Query(default=2000.0, ge=100.0, le=1_000_000.0),
+    days: int = Query(default=5, ge=1, le=15),
+):
+    """Simulate trades on confirmed pullbacks. Research only — no orders."""
+    symbol = symbol.strip().upper()
+    if not symbol.replace(".", "").isalnum():
+        raise HTTPException(status_code=422, detail="Invalid symbol")
+
+    try:
+        client = get_data_client()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        raw = fetch_minute_bars(client, [symbol], days=days)
+        bars = completed_minute_bars(raw.get(symbol, []))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
+
+    try:
+        trading_client = get_trading_client()
+    except RuntimeError:
+        trading_client = None
+    trading_days = _fetch_trading_days(
+        trading_client,
+        (datetime.now(timezone.utc) - timedelta(days=days + 5)).date(),
+        datetime.now(timezone.utc).date(),
+    )
+    session_verified = trading_days is not None
+    if session_verified:
+        bars = filter_regular_session_bars(bars, trading_days)
+    else:
+        bars = []
+
+    patterns = detect_pullbacks(bars, symbol=symbol)
+    config = TradeConfig(
+        initial_equity=initial_equity,
+        risk_pct=risk_pct,
+        stop_loss_pct=stop_loss_pct,
+        profit_target_pct=profit_target_pct,
+    )
+    result = simulate_pullback_trades(bars, patterns, config)
+
+    return {
+        "symbol": symbol,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "session_verified": session_verified,
+        "config": {
+            "initial_equity": initial_equity,
+            "risk_pct": risk_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "profit_target_pct": profit_target_pct,
+        },
+        "bars_analyzed": len(bars),
+        "patterns_confirmed": result.patterns_confirmed,
+        "trades_entered": len(result.trades),
+        "skipped": [[ts.isoformat(), reason] for ts, reason in result.skipped],
+        "win_rate": result.win_rate,
+        "gross_pnl": result.gross_pnl,
+        "net_pnl": result.net_pnl,
+        "ending_equity": result.ending_equity,
+        "max_drawdown": result.max_drawdown,
+        "exit_reasons": result.exit_reasons,
+        "trades": [asdict(t) for t in result.trades],
     }

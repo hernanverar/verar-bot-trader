@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -321,3 +321,37 @@ def test_auto_empty_discovery_is_not_a_422():
     assert data["results"] == []
     assert data["discovery_warning"]
     scan.assert_not_called()
+
+def test_chart_bars_endpoint():
+    from types import SimpleNamespace
+
+    now = datetime.now(timezone.utc)
+    fake_bars = [
+        SimpleNamespace(
+            timestamp=now.replace(minute=0) - timedelta(hours=2),
+            open=100.0, high=101.0, low=99.0, close=100.5, volume=5000,
+        )
+    ]
+
+    class FakeResult:
+        data = {"AAPL": fake_bars}
+
+    with (
+        patch("app.api.main.get_data_client") as gdc,
+        patch.object(gdc.return_value, "get_stock_bars", return_value=FakeResult()),
+    ):
+        response = client.get("/api/charts/bars?symbol=aapl&interval=1")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["symbol"] == "AAPL"
+    assert data["interval_min"] == 1
+    assert data["feed"]
+    assert len(data["bars"]) == 1
+    assert data["bars"][0]["close"] == 100.5
+
+
+def test_chart_bars_validation():
+    assert client.get("/api/charts/bars?symbol=AAPL&interval=7").status_code == 422
+    assert client.get("/api/charts/bars?symbol=***").status_code == 422
+    assert client.get("/api/charts/bars").status_code == 422
