@@ -111,8 +111,11 @@ def coverage_stats(
 
 # ---- Snapshot storage --------------------------------------------------
 
-def _snap_dir(symbol: str, session: str) -> Path:
-    return ROOT / "snapshots" / symbol.upper() / session
+def _snap_dir(symbol: str, session: str, feed: str = "iex") -> Path:
+    # iex keeps the legacy path for backward compatibility with existing
+    # snapshots and result references; other feeds live in a subdir.
+    base = ROOT / "snapshots" / symbol.upper() / session
+    return base if feed == "iex" else base / feed
 
 
 def _next_version(d: Path) -> int:
@@ -135,10 +138,11 @@ def _atomic_write(path: Path, payload: str) -> None:
 
 
 def save_snapshot(
-    symbol: str, session: str, bars: list, meta: dict
+    symbol: str, session: str, bars: list, meta: dict, feed: str = "iex"
 ) -> dict:
     """Write an immutable versioned snapshot. Returns meta with sha256."""
-    d = _snap_dir(symbol, session)
+    meta = {**meta, "feed": feed}
+    d = _snap_dir(symbol, session, feed)
     v = _next_version(d)
     d.mkdir(parents=True, exist_ok=True)
     payload = "\n".join(
@@ -156,14 +160,15 @@ def save_snapshot(
     return meta
 
 
-def list_versions(symbol: str, session: str) -> list[int]:
-    d = _snap_dir(symbol, session)
+def list_versions(symbol: str, session: str, feed: str = "iex") -> list[int]:
+    d = _snap_dir(symbol, session, feed)
     return sorted(int(p.stem[1:]) for p in d.glob("v*.jsonl")
                   if p.stem[1:].isdigit())
 
 
-def load_snapshot(symbol: str, session: str, version: int | None = None) -> list[dict]:
-    d = _snap_dir(symbol, session)
+def load_snapshot(symbol: str, session: str, version: int | None = None,
+                  feed: str = "iex") -> list[dict]:
+    d = _snap_dir(symbol, session, feed)
     if version is None:
         vs = list_versions(symbol, session)
         if not vs:
@@ -175,17 +180,18 @@ def load_snapshot(symbol: str, session: str, version: int | None = None) -> list
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
-def snapshot_hash(symbol: str, session: str, version: int) -> str | None:
-    meta = _snap_dir(symbol, session) / f"meta_v{version}.json"
+def snapshot_hash(symbol: str, session: str, version: int, feed: str = "iex") -> str | None:
+    meta = _snap_dir(symbol, session, feed) / f"meta_v{version}.json"
     if not meta.exists():
         return None
     return json.loads(meta.read_text()).get("sha256")
 
 
-def compare_versions(symbol: str, session: str, v1: int, v2: int) -> dict:
+def compare_versions(symbol: str, session: str, v1: int, v2: int,
+                     feed: str = "iex") -> dict:
     """Diff two frozen snapshots — detects backfill/changed bars."""
-    a = {r["t"]: r for r in load_snapshot(symbol, session, v1)}
-    b = {r["t"]: r for r in load_snapshot(symbol, session, v2)}
+    a = {r["t"]: r for r in load_snapshot(symbol, session, v1, feed)}
+    b = {r["t"]: r for r in load_snapshot(symbol, session, v2, feed)}
     changed = [t for t in a if t in b and a[t] != b[t]]
     return {
         "added": sorted(t for t in b if t not in a),
@@ -211,8 +217,11 @@ def canonical_result(result: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
-def save_result(symbol: str, session: str, version: int, result: dict) -> Path:
+def save_result(symbol: str, session: str, version: int, result: dict,
+                feed: str = "iex") -> Path:
     d = ROOT / "results" / symbol.upper() / session
+    if feed != "iex":
+        d = d / feed
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"v{version}.json"
     with _LOCK:

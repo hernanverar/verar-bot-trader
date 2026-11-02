@@ -52,6 +52,8 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--acquire", action="store_true",
                     help="fetch minute bars and write snapshots")
+    ap.add_argument("--feed", default="iex", choices=["iex", "sip"],
+                    help="bar feed (sip = consolidated, delayed ~15min)")
     args = ap.parse_args()
     universe = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     now = datetime.now(timezone.utc)
@@ -84,7 +86,17 @@ def main() -> None:
         if delta > args.days + 5:
             continue
         try:
-            raw = fetch_minute_bars(dc, [c.symbol], days=delta + 3).get(c.symbol, [])
+            if args.feed == "sip":
+                # delayed SIP: end must be <= now-15min (free tier)
+                end = min(now - timedelta(minutes=20),
+                          now.replace(hour=23, minute=59) - timedelta(days=delta))
+                start = end - timedelta(days=delta + 3)
+                req = StockBarsRequest(symbol_or_symbols=[c.symbol],
+                                       timeframe=TimeFrame.Minute,
+                                       start=start, end=end, feed="sip")
+                raw = list(dc.get_stock_bars(req).data.get(c.symbol, []))
+            else:
+                raw = fetch_minute_bars(dc, [c.symbol], days=delta + 3).get(c.symbol, [])
         except Exception as exc:
             print(f"  {c.symbol} {c.session_date}: acquisition FAILED {exc}")
             continue
@@ -96,11 +108,11 @@ def main() -> None:
                                        c.session_date).date()][1].hour == 13 else 390
         cov = coverage_stats(bars, exp)
         meta = save_snapshot(c.symbol, c.session_date, bars, {
-            "feed": "iex", "days_param": delta + 3,
+            "days_param": delta + 3,
             "calendar_verified": td is not None,
             "provisional": same_day,
             "candidate_tier": c.tier, "gain_pct": c.gain_pct,
-            "rvol": c.rvol, **cov})
+            "rvol": c.rvol, **cov}, feed=args.feed)
         print(f"  {c.symbol} {c.session_date}: v{meta['version']} "
               f"bars={len(bars)} cov={cov['coverage_pct']}% ({cov['confidence']}) "
               f"{'PROVISIONAL' if same_day else ''}")
@@ -117,7 +129,7 @@ def main() -> None:
             "git_commit": git_commit(),
             "snapshot_version": meta["version"],
             "snapshot_sha256": meta["sha256"],
-            "feed": "iex",
+            "feed": args.feed,
             "sim_assumptions": {
                 "entry_slippage_bps": 5.0, "exit_slippage_bps": 5.0,
                 "commission": 0.0, "risk_reward": 2.0,
@@ -134,7 +146,7 @@ def main() -> None:
             "run_ts": now.isoformat(),
         }
         result["canonical"] = canonical_result(result)
-        save_result(c.symbol, c.session_date, meta["version"], result)
+        save_result(c.symbol, c.session_date, meta["version"], result, feed=args.feed)
         print(f"    -> setups={len(setups)} trades={len(sim.trades)} "
               f"pnl={sim.net_pnl} canonical={result['canonical'][:12]}")
 

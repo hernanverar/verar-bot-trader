@@ -92,3 +92,19 @@ def test_config_hash_and_canonical_result():
     r1 = {"setups": 1, "run_ts": "a", "git_commit": "x", "pnl": -20.3}
     r2 = {"setups": 1, "run_ts": "b", "git_commit": "y", "pnl": -20.3}
     assert rs.canonical_result(r1) == rs.canonical_result(r2)
+
+
+def test_feed_isolation(store):
+    """SIP and IEX snapshots never cross-load; missing feed reads empty."""
+    iex_bars = [bar(0, 0, c=2.0)]
+    sip_bars = [bar(0, 0, c=9.9)]
+    rs.save_snapshot("X", "2026-01-15", iex_bars, {}, feed="iex")
+    rs.save_snapshot("X", "2026-01-15", sip_bars, {}, feed="sip")
+    assert rs.load_snapshot("X", "2026-01-15", feed="iex")[0]["c"] == 2.0
+    assert rs.load_snapshot("X", "2026-01-15", feed="sip")[0]["c"] == 9.9
+    # wrong feed/version combos return empty, never arbitrary files
+    assert rs.load_snapshot("X", "2026-01-15", version=99, feed="sip") == []
+    assert rs.load_snapshot("X", "2026-01-15", feed="sip") != \
+        rs.load_snapshot("X", "2026-01-15", feed="iex")
+    assert rs.list_versions("X", "2026-01-15", feed="iex") == [1]
+    assert rs.list_versions("X", "2026-01-15", feed="sip") == [1]
