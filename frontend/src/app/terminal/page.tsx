@@ -56,6 +56,24 @@ type SimTrade = {
   equity_after: number;
 };
 
+type AlertRec = {
+  id: string;
+  symbol: string;
+  alert_type: string;
+  level: number | null;
+  enabled: boolean;
+  state: { fired?: boolean };
+};
+
+type AlertEvt = {
+  id: string;
+  symbol: string;
+  alert_type: string;
+  trigger_price: number;
+  ts: string;
+  message: string;
+};
+
 type SimResult = {
   patterns_confirmed: number;
   trades_entered: number;
@@ -135,6 +153,85 @@ function TerminalInner() {
   const simInFlight = useRef(false);
   const [showRthVwap, setShowRthVwap] = useState(false);
 
+  // ---- Alerts (Phase 2C) ----
+  const [alerts, setAlerts] = useState<AlertRec[]>([]);
+  const [alertEvents, setAlertEvents] = useState<AlertEvt[]>([]);
+  const [alertType, setAlertType] = useState("price_above");
+  const [alertLevel, setAlertLevel] = useState("");
+  const [notifyOn, setNotifyOn] = useState(false);
+  const notifiedRef = useRef<Set<string>>(new Set());
+
+  const refreshAlerts = useCallback(async () => {
+    const res = await fetch("/api/alerts");
+    if (res.ok) {
+      const j = await res.json();
+      setAlerts(j.alerts ?? []);
+      setAlertEvents((j.events ?? []).slice(-20).reverse());
+    }
+  }, []);
+
+  useEffect(() => { void refreshAlerts(); }, [refreshAlerts]);
+
+  const createAlert = async () => {
+    const lvl = alertLevel ? parseFloat(alertLevel) : null;
+    if (["price_above", "price_below", "stop_level"].includes(alertType) && !lvl) return;
+    await fetch("/api/alerts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, alert_type: alertType, level: lvl }),
+    });
+    setAlertLevel("");
+    await refreshAlerts();
+  };
+
+  const alertAction = async (id: string, action: "patch" | "delete" | "rearm", body?: object) => {
+    const method = action === "delete" ? "DELETE" : action === "patch" ? "PATCH" : "POST";
+    await fetch(`/api/alerts/${id}${action === "rearm" ? "/rearm" : ""}`, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    await refreshAlerts();
+  };
+
+  const evalInFlight = useRef(false);
+  const [skippedSymbols, setSkippedSymbols] = useState<string[]>([]);
+
+  // Evaluate on every poll cycle — completed bars only, server-verified.
+  // Independent of chart refresh so other symbols keep evaluating on failure.
+  const evaluateAlerts = useCallback(async () => {
+    if (evalInFlight.current) return;   // no overlapping evaluations
+    evalInFlight.current = true;
+    try {
+      const res = await fetch("/api/alerts/evaluate", { method: "POST" });
+      const j = await res.json().catch(() => ({}));
+      setSkippedSymbols(j.skipped_symbols ?? []);
+      const fresh: AlertEvt[] = j.new_events ?? [];
+      if (fresh.length) {
+        await refreshAlerts();
+        if (notifyOn && "Notification" in window && Notification.permission === "granted") {
+          for (const e of fresh) {
+            if (!notifiedRef.current.has(e.id)) {
+              notifiedRef.current.add(e.id);
+              new Notification(e.symbol, {
+                body: `${e.message} · ${ET_FULL.format(new Date(e.ts).getTime())}`,
+              });
+            }
+          }
+        }
+      }
+    } finally {
+      evalInFlight.current = false;
+    }
+  }, [notifyOn, refreshAlerts]);
+
+  const enableNotifications = async () => {
+    if (!("Notification" in window)) { setNotifyOn(false); return; }
+    if (Notification.permission === "granted") { setNotifyOn(true); return; }
+    const p = await Notification.requestPermission();
+    setNotifyOn(p === "granted");
+  };
+
   const reqSeq = useRef(0);
 
   const load = useCallback(async (sym: string, iv: number) => {
@@ -175,8 +272,11 @@ function TerminalInner() {
     } finally {
       inFlightRef.current = false;
       if (seq === reqSeq.current) setLoading(false);
+      // Evaluate alerts on every poll cycle — success or failure — so
+      // alerts for other symbols never depend on this chart's refresh.
+      void evaluateAlerts();
     }
-  }, []);
+  }, [evaluateAlerts]);
 
   useEffect(() => {
     void load(symbol, interval);
@@ -548,6 +648,103 @@ function TerminalInner() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-white/10 bg-[#111b2d] p-4 sm:p-6">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold">Alerts</h3>
+              <p className="text-xs text-slate-500">
+                Completed-bar based · evaluates while this terminal is open ·
+                informational only, never executes orders.
+              </p>
+            </div>
+            {skippedSymbols.length > 0 && (
+              <p className="w-full rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-300">
+                Monitoring cap (10 symbols) reached — NOT monitored:{" "}
+                {skippedSymbols.join(", ")}
+              </p>
+            )}
+            <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-400">
+              <input
+                type="checkbox"
+                checked={notifyOn}
+                onChange={(e) => (e.target.checked ? void enableNotifications() : setNotifyOn(false))}
+                className="accent-blue-500"
+              />
+              Browser notifications
+            </label>
+          </div>
+
+          <div className="mb-4 flex flex-wrap items-center gap-2 text-xs">
+            <select
+              value={alertType}
+              onChange={(e) => setAlertType(e.target.value)}
+              className="rounded-lg border border-white/10 bg-[#0d1422] px-2 py-1.5 outline-none focus:border-blue-500"
+            >
+              <option value="price_above">Crosses above</option>
+              <option value="price_below">Crosses below</option>
+              <option value="hod_breakout">RTH high-of-day</option>
+              <option value="momentum">VERAR momentum</option>
+              <option value="stop_level">Stop level</option>
+            </select>
+            {["price_above", "price_below", "stop_level"].includes(alertType) && (
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                value={alertLevel}
+                onChange={(e) => setAlertLevel(e.target.value)}
+                placeholder="Price"
+                className="w-20 rounded-lg border border-white/10 bg-[#0d1422] px-2 py-1.5 outline-none focus:border-blue-500"
+              />
+            )}
+            <button
+              onClick={createAlert}
+              className="rounded-lg bg-blue-600 px-3 py-1.5 font-semibold text-white transition hover:bg-blue-500"
+            >
+              Add alert for {symbol}
+            </button>
+          </div>
+
+          {alerts.filter((a) => a.symbol === symbol).length > 0 && (
+            <ul className="mb-4 space-y-1 text-xs">
+              {alerts.filter((a) => a.symbol === symbol).map((a) => (
+                <li key={a.id} className="flex items-center gap-2 rounded-lg border border-white/5 bg-[#0d1422] px-2 py-1.5">
+                  <span className={a.enabled ? "text-slate-200" : "text-slate-500 line-through"}>
+                    {a.alert_type.replace(/_/g, " ")}{a.level != null && ` $${a.level}`}
+                  </span>
+                  {a.state.fired && <span className="rounded bg-amber-500/15 px-1.5 text-amber-400">fired</span>}
+                  <span className="ml-auto flex gap-1">
+                    {a.state.fired && (
+                      <button onClick={() => alertAction(a.id, "rearm")} className="rounded border border-white/10 px-1.5 py-0.5 text-slate-400 hover:text-slate-200">rearm</button>
+                    )}
+                    <button
+                      onClick={() => alertAction(a.id, "patch", { enabled: !a.enabled })}
+                      className="rounded border border-white/10 px-1.5 py-0.5 text-slate-400 hover:text-slate-200"
+                    >
+                      {a.enabled ? "disable" : "enable"}
+                    </button>
+                    <button onClick={() => alertAction(a.id, "delete")} className="rounded border border-red-500/30 px-1.5 py-0.5 text-red-400 hover:bg-red-500/10">✕</button>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {alertEvents.length > 0 && (
+            <div>
+              <p className="mb-1 text-xs font-medium text-slate-400">Triggered history</p>
+              <ul className="space-y-1 text-xs text-slate-300">
+                {alertEvents.map((e) => (
+                  <li key={e.id} className="flex justify-between rounded border border-white/5 px-2 py-1">
+                    <span>{e.message}</span>
+                    <span className="text-slate-500">{ET_FULL.format(new Date(e.ts).getTime())}</span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </section>

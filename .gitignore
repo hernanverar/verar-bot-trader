@@ -10,3 +10,4 @@ __pycache__/
 # Local backtest backups
 backups/
 barcoding_cycles.csv
+data/

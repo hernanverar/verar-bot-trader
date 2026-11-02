@@ -2,7 +2,10 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 from alpaca.common.exceptions import APIError
-from fastapi import FastAPI, HTTPException, Query
+import re
+import threading
+from datetime import time as dt_time
+from fastapi import Body, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.backtest import fetch_history, run_backtest
@@ -10,11 +13,13 @@ from app.market_data import DEFAULT_SYMBOLS
 from app.market_discovery import discover_momentum_universe, get_trading_client
 from app.market_session import get_market_session
 from app.intraday_data import completed_minute_bars, fetch_minute_bars, filter_regular_session_bars
-from app.market_data import _data_feed, get_data_client
+from app.market_data import MARKET_TZ, _data_feed, get_data_client
 from app.market_session import _fetch_trading_days
 from app.strategies.pullback_detector import PullbackConfig, detect_pullbacks
 from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
 from app.chart_data import rth_vwap, session_vwap
+from app import alert_store
+from app.alerts import AlertEvent, VALID_TYPES, evaluate_alert, new_alert, rearm
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from app.strategies.hot_stock_scanner import ScannerConfig, scan_hot_stocks
@@ -412,3 +417,211 @@ def pullback_simulation(
         "trades": [asdict(t) for t in result.trades],
         "unresolved": [asdict(t) for t in result.unresolved],
     }
+
+# ---- Phase 2C: configurable alerts (informational only) -----------------
+
+ALERT_SYMBOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.]{0,9}$")
+MAX_MONITORED_SYMBOLS = 10
+MOMENTUM_EVAL_INTERVAL = timedelta(seconds=60)
+
+
+def _validate_alert_body(body: dict, partial: bool = False) -> tuple | None:
+    if not partial or "symbol" in body:
+        symbol = str(body.get("symbol", "")).upper()
+        if not ALERT_SYMBOL_RE.match(symbol):
+            return None, "invalid symbol"
+    alert_type = body.get("alert_type")
+    if alert_type is not None and alert_type not in VALID_TYPES:
+        return None, "invalid alert_type"
+    level = body.get("level")
+    if level is not None and not (isinstance(level, (int, float)) and 0 < level < 100_000):
+        return None, "invalid level"
+    return True, ""
+
+
+@app.get("/api/alerts")
+def list_alerts():
+    alerts = alert_store.load_alerts()
+    events = alert_store.load_events()
+    return {
+        "alerts": [a.to_dict() for a in alerts],
+        "events": [e.to_dict() for e in events],
+        "note": "completed-bar based, informational only — evaluates while terminal is open",
+    }
+
+
+@app.post("/api/alerts")
+def create_alert(body: dict = Body(...)):
+    ok, err = _validate_alert_body(body)
+    if ok is None:
+        raise HTTPException(422, err)
+    symbol = str(body["symbol"]).upper()
+    alert_type = body["alert_type"]
+    level = body.get("level")
+    if alert_type in ("price_above", "price_below", "stop_level") and level is None:
+        raise HTTPException(422, "level required for this alert type")
+
+    alert = new_alert(symbol, alert_type, float(level) if level is not None else None)
+    # Initialize baseline from the latest server-fetched completed bar so an
+    # alert created while already past the threshold cannot false-trigger.
+    try:
+        bars = completed_minute_bars(
+            fetch_minute_bars(get_data_client(), _data_feed(), symbol, days=1)
+        )
+        if bars:
+            alert.state["last_close"] = bars[-1].close
+            alert.state["last_ts"] = bars[-1].timestamp.isoformat()
+            if alert_type == "hod_breakout":
+                day = bars[-1].timestamp.astimezone(MARKET_TZ).date()
+                sess = _fetch_trading_days(get_trading_client(), day, day) or {}
+                lo, hi = sess.get(day, (dt_time(9, 30), dt_time(16, 0)))
+                rth = [
+                    b for b in bars
+                    if (t := b.timestamp.astimezone(MARKET_TZ)).date() == day
+                    and lo <= t.time() < hi
+                ]  # RTH only — premarket never seeds the baseline
+                alert.state["session_day"] = day.isoformat()
+                alert.state["session_high"] = max((b.high for b in rth), default=None)
+    except Exception:
+        pass  # baseline stays empty — first bars will seed it silently
+
+    def _mut(alerts, events):
+        if len(alerts) >= 200:
+            raise HTTPException(422, "alert limit reached")
+        alerts.append(alert)
+        return alert.to_dict(), alerts, events
+
+    return alert_store.mutate(_mut)
+
+
+@app.patch("/api/alerts/{alert_id}")
+def update_alert(alert_id: str, body: dict = Body(...)):
+    ok, err = _validate_alert_body(body, partial=True)
+    if ok is None:
+        raise HTTPException(422, err)
+
+    def _mut(alerts, events):
+        for a in alerts:
+            if a.id == alert_id:
+                if "enabled" in body:
+                    a.enabled = bool(body["enabled"])
+                    if not a.enabled:
+                        a.state["fired"] = False
+                if "level" in body:
+                    a.level = float(body["level"])
+                    a.state["last_close"] = None  # re-arm from next bar
+                    a.state["last_ts"] = None
+                    a.state["fired"] = False
+                return a.to_dict(), alerts, events
+        raise HTTPException(404, "alert not found")
+
+    return alert_store.mutate(_mut)
+
+
+@app.delete("/api/alerts/{alert_id}")
+def delete_alert(alert_id: str):
+    def _mut(alerts, events):
+        keep = [a for a in alerts if a.id != alert_id]
+        if len(keep) == len(alerts):
+            raise HTTPException(404, "alert not found")
+        return {"deleted": alert_id}, keep, events
+    return alert_store.mutate(_mut)
+
+
+@app.post("/api/alerts/{alert_id}/rearm")
+def rearm_alert(alert_id: str):
+    def _mut(alerts, events):
+        for a in alerts:
+            if a.id == alert_id:
+                rearm(a)
+                return a.to_dict(), alerts, events
+        raise HTTPException(404, "alert not found")
+    return alert_store.mutate(_mut)
+
+
+_eval_lock = threading.Lock()
+
+
+@app.post("/api/alerts/evaluate")
+def evaluate_alerts():
+    if not _eval_lock.acquire(blocking=False):
+        return {"new_events": [], "alerts_evaluated": 0, "busy": True}
+    try:
+        return _evaluate_alerts_locked()
+    finally:
+        _eval_lock.release()
+
+
+def _evaluate_alerts_locked():
+    """Evaluate all enabled alerts against server-verified Alpaca bars.
+
+    Called by the terminal's polling loop — nothing evaluates while the
+    terminal is closed. Browser-submitted prices are never trusted; bars
+    are fetched server-side per monitored symbol (dedup by timestamp).
+    Symbols beyond MAX_MONITORED_SYMBOLS are skipped and reported.
+    """
+    alerts = [a for a in alert_store.load_alerts() if a.enabled]
+    all_symbols = sorted({a.symbol for a in alerts})
+    symbols = all_symbols[:MAX_MONITORED_SYMBOLS]
+    skipped_symbols = all_symbols[MAX_MONITORED_SYMBOLS:]
+    new_events: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    for sym in symbols:
+        sym_alerts = [a for a in alerts if a.symbol == sym]
+        try:
+            data_client = get_data_client()
+            bars = completed_minute_bars(
+                fetch_minute_bars(data_client, [sym], days=1).get(sym, [])
+            )
+        except Exception:
+            continue  # data unavailable — evaluate nothing, alert nothing
+        trading_client = None
+        try:
+            trading_client = get_trading_client()
+        except RuntimeError:
+            pass
+        today = (now.astimezone(MARKET_TZ)).date()
+        sess = _fetch_trading_days(trading_client, today - timedelta(days=3), today)
+
+        momentum_eligible = None
+        if any(a.alert_type == "momentum" for a in sym_alerts):
+            last_eval = max(
+                (a.state.get("momentum_eval_ts") for a in sym_alerts if a.state.get("momentum_eval_ts")),
+                default=None,
+            )
+            if last_eval is None or now - datetime.fromisoformat(last_eval) >= MOMENTUM_EVAL_INTERVAL:
+                try:
+                    session_info = get_market_session(now=now, trading_client=trading_client)
+                    res = scan_hot_stocks([sym], data_client, now=now, session_info=session_info)
+                    momentum_eligible = bool(res and res[0].ross_eligible)
+                    for a in sym_alerts:
+                        a.state["momentum_eval_ts"] = now.isoformat()
+                except Exception:
+                    momentum_eligible = None
+
+        for a in sym_alerts:
+            new_bars = [
+                b for b in bars
+                if a.state.get("last_ts") is None or b.timestamp > datetime.fromisoformat(a.state["last_ts"])
+            ]
+            evs = evaluate_alert(a, new_bars, session_times=sess, momentum_eligible=momentum_eligible)
+            if a.state.get("last_ts"):
+                a.state["last_ts"] = a.state["last_ts"] if isinstance(a.state["last_ts"], str) else a.state["last_ts"].isoformat()
+            if a.state.get("session_day") and not isinstance(a.state["session_day"], str):
+                a.state["session_day"] = a.state["session_day"].isoformat()
+            new_events.extend(e.to_dict() for e in evs)
+
+    def _mut(store_alerts, events):
+        by_id = {a.id: a for a in alerts}
+        for i, a in enumerate(store_alerts):
+            if a.id in by_id:
+                store_alerts[i] = by_id[a.id]
+        return {
+            "new_events": new_events,
+            "alerts_evaluated": len(alerts),
+            "monitored_symbols": len(symbols),
+            "skipped_symbols": skipped_symbols,
+        }, store_alerts, events + [AlertEvent.from_dict(e) for e in new_events]
+
+    return alert_store.mutate(_mut)

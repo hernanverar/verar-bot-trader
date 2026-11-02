@@ -14,6 +14,25 @@ python -m app.main
 
 The demo uses synthetic sample data, not current market prices.
 
+## Local development (localhost only)
+
+Run both services bound to `127.0.0.1` — the backend and the Next.js API
+proxy routes are **unauthenticated** by design for the local prototype:
+
+```bash
+.venv/bin/python -m uvicorn app.api.main:app --reload --host 127.0.0.1 --port 8000
+cd frontend && npm run dev   # Next.js dev binds localhost by default
+```
+
+**Security boundary:** the FastAPI endpoints (including `POST/PATCH/DELETE
+/api/alerts` and `POST /api/alerts/evaluate`) accept JSON writes with no
+authentication or CSRF protection, and the `frontend/src/app/api/*` proxy
+routes forward them directly. Do NOT expose either server to a public
+interface or network (`--host 0.0.0.0`, tunneling, or deployed hosting)
+without adding authentication, authorization, and request protections.
+The current topology keeps FastAPI reachable only from the local Next.js
+server, and the Next.js server only from this machine's browser.
+
 ## Market-data scan
 
 `python -m app.main --scan` fetches real daily bars and latest quotes via the
