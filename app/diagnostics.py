@@ -22,13 +22,14 @@ _lock = threading.Lock()
 # Allowed fields per event kind — arbitrary payloads are NOT accepted.
 _SCHEMAS: dict[str, set[str]] = {
     "scanner_eval": {"symbols", "eligible", "research", "filtered", "unavailable", "session", "calendar_verified", "duration_ms"},
-    "chart_refresh": {"symbol", "interval_min", "ok", "fetch_ms", "last_data_ts", "data_age_ms", "bars", "error"},
+    "chart_refresh": {"symbol", "interval_min", "ok", "fetch_ms", "last_data_ts", "data_age_ms", "bars", "error", "session"},
     "alpaca_error": {"context", "symbol", "error"},
     "alert_eval": {"alerts_evaluated", "monitored_symbols", "skipped_symbols", "new_events", "busy", "duration_ms"},
-    "alert_triggered": {"alert_id", "symbol", "alert_type", "bar_ts", "eval_ts", "alert_latency_ms", "trigger_price"},
+    "alert_triggered": {"alert_id", "symbol", "alert_type", "bar_ts", "eval_ts", "alert_latency_ms", "trigger_price", "replay"},
     "sim_run": {"symbol", "patterns_confirmed", "trades_entered", "unresolved", "net_pnl", "exit_reasons", "duration_ms"},
     "client_event": {"client_kind", "event_id", "symbol", "reported_at", "detail"},
     "session_gap": {"symbol", "last_data_ts", "gap_ms", "observed_at"},
+    "api_error": {"context", "error"},
 }
 
 _SENSITIVE_KEY = re.compile(r"(?i)(api[_-]?key|secret|token|password|authoriz|credential)")
@@ -170,6 +171,13 @@ def session_report(day: date, calendar: dict | None) -> dict:
             "failed": sum(1 for r in charts if not r.get("ok")),
         },
         "data_freshness_ms": _stats([r.get("data_age_ms") for r in charts]),
+        "data_freshness_rth_ms": _stats(
+            [r.get("data_age_ms") for r in charts if r.get("session") == "regular"]
+        ),
+        "data_freshness_non_rth_ms": _stats(
+            [r.get("data_age_ms") for r in charts
+             if r.get("session") not in (None, "regular")]
+        ),
         "api_fetch_ms": _stats([r.get("fetch_ms") for r in charts]),
         "alert_evaluations": {
             "measured": len(evals),
@@ -177,8 +185,12 @@ def session_report(day: date, calendar: dict | None) -> dict:
             "skipped_symbols": skipped,
         },
         "alert_events": {
-            "measured": len(triggers),
-            "alert_latency_ms": _stats([r.get("alert_latency_ms") for r in triggers]),
+            "raw_records": len(triggers),          # logged triggers incl. replays
+            "unique_events": len({(t.get("alert_id"), t.get("bar_ts")) for t in triggers}),
+            "replay_events": sum(1 for t in triggers if t.get("replay")),
+            "alert_latency_ms": _stats(
+                [r.get("alert_latency_ms") for r in triggers if not r.get("replay")]
+            ),  # replay latency excluded — not live detection lag
         },
         "client_reported": {
             "count": len(client_events),

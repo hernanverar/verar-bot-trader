@@ -126,3 +126,48 @@ def test_size_cap_reported_as_limitation(store, monkeypatch):
     diag.record("scanner_eval", session="regular")
     rep = diag.session_report(datetime.now(tz=ET).date(), None)
     assert any("size cap" in n for n in rep["completeness"]["notes"])
+
+
+def test_raw_vs_unique_and_replay(store):
+    """40 logged triggers for one real event -> raw 40, unique 1, replay excluded from latency."""
+    today = datetime.now(tz=ET).date()
+    path = store / f"{today.isoformat()}.jsonl"
+    lines = [
+        json.dumps({"kind": "alert_triggered", "alert_id": "a1", "bar_ts": "t1",
+                    "alert_latency_ms": 15_000_000, "replay": True, "ts_utc": "x"})
+        for _ in range(40)
+    ]
+    lines.append(json.dumps({"kind": "alert_triggered", "alert_id": "a1",
+                             "bar_ts": "t2", "alert_latency_ms": 21000,
+                             "replay": False, "ts_utc": "y"}))
+    path.write_text("".join(l + "\n" for l in lines))
+    rep = diag.session_report(today, None)
+    ev = rep["alert_events"]
+    assert ev["raw_records"] == 41
+    assert ev["unique_events"] == 2
+    assert ev["replay_events"] == 40
+    assert ev["alert_latency_ms"]["median"] == 21000   # replays excluded
+
+
+def test_freshness_split_by_session(store):
+    today = datetime.now(tz=ET).date()
+    path = store / f"{today.isoformat()}.jsonl"
+    recs = [
+        {"kind": "chart_refresh", "ok": True, "data_age_ms": 1000, "session": "regular", "ts_utc": "a"},
+        {"kind": "chart_refresh", "ok": True, "data_age_ms": 9_000_000, "session": "closed", "ts_utc": "b"},
+        {"kind": "chart_refresh", "ok": True, "data_age_ms": 500, "ts_utc": "c"},  # legacy record
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    rep = diag.session_report(today, None)
+    assert rep["data_freshness_rth_ms"]["median"] == 1000
+    assert rep["data_freshness_non_rth_ms"]["median"] == 9_000_000
+    assert rep["data_freshness_ms"]["count"] == 3      # legacy included in overall
+
+
+def test_api_error_schema(store):
+    diag.record("api_error", context="alerts_evaluate", error="NameError: t_eval")
+    rec = diag.load_day(datetime.now(tz=ET).date())[0]
+    assert rec["kind"] == "api_error" and "t_eval" in rec["error"]
+    diag.record("api_error", context="x", api_key="S")   # redaction still applies
+    recs = diag.load_day(datetime.now(tz=ET).date())
+    assert all("api_key" not in r for r in recs)

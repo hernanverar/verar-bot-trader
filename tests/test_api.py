@@ -381,3 +381,23 @@ def test_alerts_evaluate_endpoint_no_crash(monkeypatch):
     body = res.json()
     assert body["new_events"] == []
     assert not body.get("busy")
+
+
+def test_evaluate_exception_records_api_error(monkeypatch):
+    """An internal failure in evaluation must surface as api_error diagnostic
+    while still returning HTTP 500 to the caller."""
+    import app.api.main as api_main
+    import app.alert_store as store
+    from app.diagnostics import load_day
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    records = []
+    monkeypatch.setattr(api_main, "_diag", lambda kind, **kw: records.append(kind))
+    monkeypatch.setattr(
+        api_main, "_evaluate_alerts_locked",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    res = TestClient(app, raise_server_exceptions=False).post("/api/alerts/evaluate")
+    assert res.status_code == 500
+    assert "api_error" in records

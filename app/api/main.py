@@ -139,9 +139,21 @@ def hot_stocks(
             else []
         )
     except RuntimeError as exc:
+        _diag("alpaca_error", context="scanner", error=str(exc)[:200])
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except APIError as exc:
+        _diag("alpaca_error", context="scanner", error="upstream APIError")
         raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
+
+    counts: dict[str, int] = {}
+    for st in results:
+        counts[st.classification] = counts.get(st.classification, 0) + 1
+    _diag("scanner_eval", symbols=len(results),
+          eligible=counts.get("eligible", 0), research=counts.get("research", 0),
+          filtered=counts.get("filtered", 0), unavailable=counts.get("unavailable", 0),
+          session=session_info.session,
+          calendar_verified=session_info.calendar_verified,
+          duration_ms=None)
 
     return {
         "as_of": datetime.now(timezone.utc).isoformat(),
@@ -301,7 +313,7 @@ def chart_bars(
         _diag("alpaca_error", context="chart_bars", symbol=symbol, error="upstream APIError")
         _diag("chart_refresh", symbol=symbol, interval_min=interval, ok=False,
               fetch_ms=round((time.monotonic() - t0) * 1000, 1),
-              error="Upstream market-data error")
+              error="Upstream market-data error", session=None)
         raise HTTPException(status_code=502, detail="Upstream market-data error") from exc
     fetch_ms = round((time.monotonic() - t0) * 1000, 1)
 
@@ -339,6 +351,7 @@ def chart_bars(
         last_data_ts=int(last_ts.timestamp()) if last_ts else None,
         # bar-completion -> receipt, accounting for the bar's own duration
         data_age_ms=round((now - (last_ts + step)).total_seconds() * 1000, 1) if last_ts else None,
+        session=session_info.session,
     )
 
     return {
@@ -577,6 +590,10 @@ def evaluate_alerts():
         return {"new_events": [], "alerts_evaluated": 0, "busy": True}
     try:
         return _evaluate_alerts_locked()
+    except Exception as exc:
+        _diag("api_error", context="alerts_evaluate",
+              error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        raise
     finally:
         _eval_lock.release()
 
@@ -645,7 +662,8 @@ def _evaluate_alerts_locked():
                       alert_type=a.alert_type, bar_ts=e.ts.isoformat(),
                       eval_ts=now.isoformat(),
                       alert_latency_ms=round((now - e.ts).total_seconds() * 1000, 1),
-                      trigger_price=e.trigger_price)
+                      trigger_price=e.trigger_price,
+                      replay=e.ts < a.created_ts)  # pre-creation bar = historical
             new_events.extend(e.to_dict() for e in evs)
 
     def _mut(store_alerts, events):
