@@ -575,7 +575,6 @@ def evaluate_alerts():
         _diag("alert_eval", alerts_evaluated=0, busy=True, skipped_symbols=[],
               monitored_symbols=0, new_events=0, duration_ms=None)
         return {"new_events": [], "alerts_evaluated": 0, "busy": True}
-    t_eval = time.monotonic()
     try:
         return _evaluate_alerts_locked()
     finally:
@@ -590,6 +589,7 @@ def _evaluate_alerts_locked():
     are fetched server-side per monitored symbol (dedup by timestamp).
     Symbols beyond MAX_MONITORED_SYMBOLS are skipped and reported.
     """
+    t_eval = time.monotonic()
     alerts = [a for a in alert_store.load_alerts() if a.enabled]
     all_symbols = sorted({a.symbol for a in alerts})
     symbols = all_symbols[:MAX_MONITORED_SYMBOLS]

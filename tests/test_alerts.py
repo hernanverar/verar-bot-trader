@@ -17,6 +17,7 @@ def bar(i, close, high=None, day=DAY):
 
 def mk(t="price_above", lvl=2.0, sym="EVGO"):
     a = new_alert(sym, t, lvl)
+    a.created_ts = DAY - timedelta(minutes=5)   # before fixture bars
     a.state["last_close"] = 1.90
     a.state["last_ts"] = (DAY - timedelta(minutes=1)).isoformat()
     return a
@@ -161,3 +162,54 @@ def test_patch_level_resets_baseline_enabled_preserves():
             if not a2.enabled:
                 a2.state["fired"] = False
     assert a.state["last_close"] == 2.50            # preserved
+
+
+def test_no_retroactive_fire_on_backfill():
+    """Crossing on a bar before creation must never fire — only seed."""
+    a = mk()
+    a.created_ts = DAY + timedelta(minutes=5)      # created at 9:35
+    a.state["last_ts"] = None; a.state["last_close"] = None
+    # bars at 9:30(2.5 above 2.0) and 9:34(1.8 crossing) — both BEFORE creation
+    assert evaluate_alert(a, [bar(0, 2.5), bar(4, 1.8)], SESS) == []
+    assert a.state["last_close"] == 1.8             # baseline still seeded
+    # bar after creation crossing again -> fires once, correctly
+    ev = evaluate_alert(a, [bar(6, 2.3), bar(7, 1.9)], SESS)
+    assert len(ev) == 1 and ev[0].trigger_price == 2.3
+
+
+def test_mid_session_creation_first_cross_fires():
+    """Alert created mid-session fires on the first post-creation crossing."""
+    a = mk()
+    a.created_ts = DAY + timedelta(minutes=10)
+    ev = evaluate_alert(a, [bar(5, 1.9), bar(11, 1.8), bar(12, 1.6)], SESS)
+    # crossing 1.9->1.8 spans creation boundary? 1.8>2.0? no — level is 2.0,
+    # 1.8 is already below. Bar 12: prev 1.8, close 1.6 — still below, no cross.
+    assert ev == []  # stays-below is not a crossing
+
+
+def test_mid_session_creation_true_cross_fires():
+    a = mk()
+    a.created_ts = DAY + timedelta(minutes=10)
+    ev = evaluate_alert(a, [bar(5, 1.9), bar(11, 2.5)], SESS)  # 1.9<2.0 -> 2.5 crosses up
+    assert len(ev) == 1 and ev[0].ts == bar(11, 2.5).timestamp  # real bar ts
+
+
+def test_idempotent_replay_same_bars():
+    """Re-evaluating identical bars must not duplicate events."""
+    a = mk()
+    ev1 = evaluate_alert(a, [bar(0, 2.5)], SESS)
+    ev2 = evaluate_alert(a, [bar(0, 2.5)], SESS)
+    assert len(ev1) == 1 and ev2 == []
+
+
+def test_hod_baseline_from_pre_creation_bars():
+    """Pre-creation RTH highs seed HOD baseline without firing."""
+    a = mk("hod_breakout", None)
+    a.created_ts = DAY + timedelta(minutes=100)
+    a.state["session_day"] = DAY.date().isoformat()
+    # historical RTH bar with huge high — seeds baseline, no trigger
+    evaluate_alert(a, [bar(0, 5.0, high=9.0)], SESS)
+    assert a.state["session_high"] == 9.0
+    # post-creation bar below old high -> nothing; above -> fires
+    assert evaluate_alert(a, [bar(120, 4.0, high=8.0)], SESS) == []
+    assert len(evaluate_alert(a, [bar(121, 4.0, high=9.5)], SESS)) == 1

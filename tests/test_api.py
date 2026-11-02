@@ -361,3 +361,23 @@ def test_chart_bars_validation():
     assert client.get("/api/charts/bars?symbol=AAPL&interval=7").status_code == 422
     assert client.get("/api/charts/bars?symbol=***").status_code == 422
     assert client.get("/api/charts/bars").status_code == 422
+
+
+def test_alerts_evaluate_endpoint_no_crash(monkeypatch):
+    """Regression: /api/alerts/evaluate must not 500 on NameError.
+
+    The Phase 2D instrumentation referenced t_eval inside the store
+    mutation closure — outside its scope — 500ing every evaluation,
+    which silently prevented alert state persistence and firing."""
+    import app.alert_store as store
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(store, "load_alerts", lambda: [])
+    monkeypatch.setattr(store, "load_events", lambda: [])
+    monkeypatch.setattr(store, "mutate", lambda fn: fn([], [])[0])
+    client = TestClient(app)
+    res = client.post("/api/alerts/evaluate")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["new_events"] == []
+    assert not body.get("busy")

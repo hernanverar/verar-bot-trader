@@ -143,6 +143,9 @@ def evaluate_alert(
         last_ts = datetime.fromisoformat(last_ts)  # persisted state
     if isinstance(st.get("session_day"), str):
         st["session_day"] = date.fromisoformat(st["session_day"])
+    created = alert.created_ts
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=MARKET_TZ)
 
     for b in sorted(bars, key=lambda x: x.timestamp):
         ts = b.timestamp
@@ -164,6 +167,12 @@ def evaluate_alert(
                 st["session_high"] = None
                 st["fired"] = False
             high = st["session_high"]
+            # Bars before creation seed the baseline but can never fire —
+            # no retroactive alerts on historical data.
+            if ts <= created:
+                st["session_high"] = max(high or 0.0, b.high)
+                st["last_close"], st["last_ts"] = b.close, ts
+                continue
             if high is not None and b.high > high and not st["fired"]:
                 st["fired"] = True
                 events.append(AlertEvent(
@@ -180,7 +189,7 @@ def evaluate_alert(
                 continue
             prev = st["last_close"]
             lvl = alert.level
-            if prev is not None and lvl is not None:
+            if prev is not None and lvl is not None and ts > created:
                 above = alert.alert_type == "price_above" and prev < lvl <= b.close
                 below = (
                     alert.alert_type in ("price_below", "stop_level")
