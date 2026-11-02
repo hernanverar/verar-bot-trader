@@ -64,6 +64,30 @@ type HotStock = {
   as_of: string | null;
 };
 
+type SimTrade = {
+  symbol: string;
+  entry_ts: string;
+  entry_price: number;
+  shares: number;
+  exit_ts: string;
+  exit_price: number;
+  exit_reason: string;
+  net_pnl: number;
+};
+
+type SimResult = {
+  patterns_confirmed: number;
+  trades_entered: number;
+  skipped: [string, string][];
+  win_rate: number | null;
+  gross_pnl: number;
+  net_pnl: number;
+  ending_equity: number;
+  max_drawdown: number;
+  exit_reasons: Record<string, number>;
+  trades: SimTrade[];
+};
+
 type PullbackPattern = {
   symbol: string;
   state: "impulse_detected" | "pullback_in_progress" | "recovery_confirmed" | "invalidated";
@@ -147,6 +171,13 @@ export default function Home() {
   const [pbLoading, setPbLoading] = useState(false);
   const [pbError, setPbError] = useState("");
   const [pbMeta, setPbMeta] = useState<{ bars: number; count: number } | null>(null);
+  const [simEquity, setSimEquity] = useState("2000");
+  const [simStop, setSimStop] = useState("5");
+  const [simTarget, setSimTarget] = useState("15");
+  const [simRisk, setSimRisk] = useState("1");
+  const [simResult, setSimResult] = useState<SimResult | null>(null);
+  const [simLoading, setSimLoading] = useState(false);
+  const [simError, setSimError] = useState("");
 
   async function runBacktest() {
     setLoading(true);
@@ -264,6 +295,37 @@ export default function Home() {
       setPbError(err instanceof Error ? err.message : "Unexpected error");
     } finally {
       setPbLoading(false);
+    }
+  }
+
+  async function runSimulation() {
+    const symbol = pbSymbol.trim().toUpperCase();
+    if (!symbol) {
+      setSimError("Select a symbol first.");
+      return;
+    }
+    setSimLoading(true);
+    setSimError("");
+    try {
+      const params = new URLSearchParams({
+        symbol,
+        initial_equity: simEquity,
+        stop_loss_pct: simStop,
+        profit_target_pct: simTarget,
+        risk_pct: String(Number(simRisk) / 100),
+      });
+      const response = await fetch(`/api/strategies/pullback-simulation?${params}`);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          typeof data.detail === "string" ? data.detail : "Simulation failed",
+        );
+      }
+      setSimResult(data);
+    } catch (err) {
+      setSimError(err instanceof Error ? err.message : "Unexpected error");
+    } finally {
+      setSimLoading(false);
     }
   }
 
@@ -947,6 +1009,136 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+            </>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-white/10 bg-[#111b2d] p-6">
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h3 className="text-lg font-semibold">Pullback Simulation</h3>
+              <p className="text-sm text-slate-400">
+                Historical simulation of confirmed patterns — not actual
+                trading performance.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {(
+                [
+                  ["Equity $", simEquity, setSimEquity],
+                  ["Stop %", simStop, setSimStop],
+                  ["Risk %", simRisk, setSimRisk],
+                ] as const
+              ).map(([label, val, set]) => (
+                <label key={label} className="flex items-center gap-1 text-slate-400">
+                  {label}
+                  <input
+                    type="number"
+                    value={val}
+                    onChange={(e) => set(e.target.value)}
+                    className="w-20 rounded-lg border border-white/10 bg-[#080d17] px-2 py-2 outline-none focus:border-blue-500"
+                  />
+                </label>
+              ))}
+              <label className="flex items-center gap-1 text-slate-400">
+                Target
+                <select
+                  value={simTarget}
+                  onChange={(e) => setSimTarget(e.target.value)}
+                  className="rounded-lg border border-white/10 bg-[#080d17] px-2 py-2 outline-none focus:border-blue-500"
+                >
+                  <option value="15">15%</option>
+                  <option value="20">20%</option>
+                </select>
+              </label>
+              <button
+                onClick={runSimulation}
+                disabled={simLoading}
+                className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold transition hover:bg-blue-500 disabled:opacity-50"
+              >
+                {simLoading ? (
+                  <LoaderCircle className="animate-spin" size={16} />
+                ) : (
+                  <BarChart3 size={16} />
+                )}
+                {simLoading ? "Simulating..." : "Run Simulation"}
+              </button>
+            </div>
+          </div>
+
+          {simError && (
+            <p role="alert" className="mb-4 text-sm text-red-400">
+              {simError}
+            </p>
+          )}
+
+          {simResult === null ? (
+            <p className="py-6 text-center text-sm text-slate-500">
+              Run a simulation on the selected symbol. Uses the same symbol as
+              Pullback Research.
+            </p>
+          ) : (
+            <>
+              <div className="mb-4 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4 lg:grid-cols-7">
+                {(
+                  [
+                    ["Patterns", simResult.patterns_confirmed],
+                    ["Trades", simResult.trades_entered],
+                    ["Win rate", simResult.win_rate !== null ? `${simResult.win_rate}%` : "n/a"],
+                    ["Gross P/L", money(simResult.gross_pnl)],
+                    ["Net P/L", money(simResult.net_pnl)],
+                    ["End equity", money(simResult.ending_equity)],
+                    ["Max DD", `${simResult.max_drawdown}%`],
+                  ] as const
+                ).map(([label, val]) => (
+                  <div key={label} className="rounded-lg border border-white/10 bg-[#0d1422] p-3">
+                    <p className="text-slate-500">{label}</p>
+                    <p className="mt-1 font-semibold text-slate-200">{val}</p>
+                  </div>
+                ))}
+              </div>
+              {Object.keys(simResult.exit_reasons).length > 0 && (
+                <p className="mb-4 text-xs text-slate-400">
+                  Exits:{" "}
+                  {Object.entries(simResult.exit_reasons)
+                    .map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`)
+                    .join(" · ")}
+                  {simResult.skipped.length > 0 &&
+                    ` · skipped: ${simResult.skipped.map((s) => s[1]).join(", ")}`}
+                </p>
+              )}
+              {simResult.trades.length === 0 ? (
+                <p className="py-4 text-center text-sm text-slate-500">
+                  No trades simulated.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-white/10 text-slate-400">
+                        {["Entry", "Price", "Shares", "Exit", "Price", "Reason", "Net P/L"].map((h) => (
+                          <th key={h} className="px-2 py-2 font-medium">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {simResult.trades.map((t) => (
+                        <tr key={t.entry_ts} className="border-b border-white/5">
+                          <td className="px-2 py-2">{new Date(t.entry_ts).toLocaleString()}</td>
+                          <td className="px-2 py-2">${t.entry_price.toFixed(2)}</td>
+                          <td className="px-2 py-2">{t.shares}</td>
+                          <td className="px-2 py-2">{new Date(t.exit_ts).toLocaleTimeString()}</td>
+                          <td className="px-2 py-2">${t.exit_price.toFixed(2)}</td>
+                          <td className="px-2 py-2">{t.exit_reason.replace(/_/g, " ")}</td>
+                          <td className={`px-2 py-2 font-semibold ${t.net_pnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                            {money(t.net_pnl)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </>
           )}
         </section>
