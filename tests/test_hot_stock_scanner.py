@@ -228,3 +228,63 @@ def test_eligible_ranks_above_higher_scored_filtered():
     assert by_symbol["AAA"].classification == "filtered"
     assert by_symbol["AAA"].score > by_symbol["BBB"].score
     assert results[0].symbol == "BBB"  # eligible always ranks first
+
+
+def test_ross_classification_parallel_to_eligibility():
+    """SPCX-style: eligible by generic gates but fails Ross RVOL/gain/price."""
+    quotes = {"AAA": FakeQuote("AAA", NOW, 141.2, 141.4)}
+    bars = []
+    for d in PRIOR_DAYS:
+        bars += minute_bars("AAA", d, 90, 100.0, 100.0, 1_000)
+    # +40.8% at $140.8 (prior close 100), normal volume (rvol ~1x)
+    # -> generic eligible; Ross fails on price and rvol only.
+    bars += minute_bars("AAA", TODAY, 90, 140.8, 140.9, 1_000)
+    results = scan_hot_stocks(
+        ["AAA"], client=FakeClient({"AAA": bars}, quotes),
+        now=NOW, session_info=verified_session(NOW),
+    )
+    r = results[0]
+    assert r.classification == "eligible"   # generic gates pass
+    assert r.ross_eligible is False
+    assert any("price outside" in f for f in r.ross_fails)
+    assert any("rvol below" in f for f in r.ross_fails)
+    assert not any("daily gain" in f for f in r.ross_fails)  # +40% meets gain
+    assert len(r.ross_unverified) == 2      # float + news disclosed, not faked
+
+
+def test_ross_classification_true_match():
+    quotes = {"AAA": FakeQuote("AAA", NOW, 8.9, 9.1)}
+    bars = []
+    for d in PRIOR_DAYS:
+        bars += minute_bars("AAA", d, 90, 8.0, 8.0, 1_000)
+    # $9 stock vs prior $8 close = +12.5%, 6x volume -> Ross passes.
+    bars += minute_bars("AAA", TODAY, 90, 9.0, 9.0, 6_000)
+    results = scan_hot_stocks(
+        ["AAA"], client=FakeClient({"AAA": bars}, quotes),
+        now=NOW, session_info=verified_session(NOW),
+    )
+    assert results[0].ross_eligible is True
+    assert results[0].ross_fails == ()
+
+
+def test_ross_price_range_boundary_ten_dollars():
+    """$15 stock fails the new $1–$10 default; configurable range honors it."""
+    quotes = {"AAA": FakeQuote("AAA", NOW, 14.9, 15.1)}
+    bars = []
+    for d in PRIOR_DAYS:
+        bars += minute_bars("AAA", d, 90, 12.0, 12.0, 1_000)
+    bars += minute_bars("AAA", TODAY, 90, 15.0, 15.0, 6_000)  # $15, +25%, 6x
+
+    strict = scan_hot_stocks(
+        ["AAA"], client=FakeClient({"AAA": bars}, quotes),
+        now=NOW, session_info=verified_session(NOW),
+    )
+    assert strict[0].ross_eligible is False
+    assert any("price outside" in f for f in strict[0].ross_fails)
+
+    wider = scan_hot_stocks(
+        ["AAA"], client=FakeClient({"AAA": bars}, quotes),
+        config=ScannerConfig(ross_price_max=20.0),
+        now=NOW, session_info=verified_session(NOW),
+    )
+    assert wider[0].ross_eligible is True  # range is configurable

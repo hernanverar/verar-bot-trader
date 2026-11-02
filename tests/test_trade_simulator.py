@@ -173,3 +173,42 @@ def test_target_scenarios_differ():
 def test_no_duplicate_trades_per_pattern():
     r = sim(pattern_bars() + [bar(13, 100.0, 101.0, 99.0, 100.5)])
     assert len(r.trades) <= r.patterns_confirmed
+
+
+def test_evgo_style_session_end_trade():
+    """Regression: recovery 9:40 -> entry 9:41 next bar, no stop/target hit,
+    exits at last regular-session bar close (no lookahead, costs applied).
+    Equity 2000, 1% risk -> shares cash-bound by buying power."""
+    bars = pattern_bars() + [
+        bar(13, 9.40, 9.50, 9.30, 9.45),   # entry bar ~9.40 open
+        bar(14, 9.45, 9.50, 9.35, 9.42),
+        bar(15, 9.42, 9.48, 9.38, 9.44),   # final regular-session bar
+    ]
+    r = sim(
+        bars,
+        TradeConfig(initial_equity=2000, risk_pct=0.01, entry_slippage_bps=0,
+                    exit_slippage_bps=0, commission_per_trade=0),
+    )
+    t = r.trades[0]
+    assert t.entry_ts == bars[13].timestamp          # next bar after confirm
+    assert t.entry_price == 9.40
+    assert t.exit_reason == "session_end"
+    assert t.exit_ts == bars[15].timestamp            # last bar of segment
+    assert t.exit_price == 9.44
+    # shares = min(floor(20/0.47)=42, floor(2000/9.40)=212) -> 42 (risk-bound)
+    assert t.shares == 42
+    assert t.net_pnl == pytest.approx((9.44 - 9.40) * 42, abs=0.01)
+
+
+def test_evgo_cash_bound_when_stop_wide():
+    """212 shares arises when buying power binds, not the risk budget."""
+    bars = pattern_bars() + [
+        bar(13, 9.40, 9.50, 9.30, 9.45),
+        bar(14, 9.45, 9.48, 9.38, 9.44),
+    ]
+    r = sim(
+        bars,
+        TradeConfig(initial_equity=2000, risk_pct=0.5, entry_slippage_bps=0,
+                    exit_slippage_bps=0, commission_per_trade=0),
+    )
+    assert r.trades[0].shares == 212  # floor(2000/9.40) — cash binds first

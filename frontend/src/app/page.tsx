@@ -1,7 +1,7 @@
 
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   Activity,
   ArrowDownRight,
@@ -56,6 +56,9 @@ type HotStock = {
   spread_bps: number | null;
   score: number | null;
   classification: "eligible" | "research" | "filtered" | "unavailable";
+  ross_eligible: boolean;
+  ross_fails: string[];
+  ross_unverified: string[];
   reasons: string[];
   research_eligible: boolean;
   bar_status: "live" | "session_ended" | "stale" | "none";
@@ -263,12 +266,17 @@ export default function Home() {
     }
   }
 
+  const scanInFlight = useRef(false);
+  const simInFlight = useRef(false);
+
   async function runPullbackScan() {
     const symbol = pbSymbol.trim().toUpperCase();
     if (!symbol) {
       setPbError("Select or enter a symbol.");
       return;
     }
+    if (scanInFlight.current) return;  // dedupe duplicate triggers
+    scanInFlight.current = true;
     setPbLoading(true);
     setPbError("");
 
@@ -294,6 +302,7 @@ export default function Home() {
     } catch (err) {
       setPbError(err instanceof Error ? err.message : "Unexpected error");
     } finally {
+      scanInFlight.current = false;
       setPbLoading(false);
     }
   }
@@ -304,6 +313,8 @@ export default function Home() {
       setSimError("Select a symbol first.");
       return;
     }
+    if (simInFlight.current) return;  // dedupe duplicate triggers
+    simInFlight.current = true;
     setSimLoading(true);
     setSimError("");
     try {
@@ -325,6 +336,7 @@ export default function Home() {
     } catch (err) {
       setSimError(err instanceof Error ? err.message : "Unexpected error");
     } finally {
+      simInFlight.current = false;
       setSimLoading(false);
     }
   }
@@ -676,6 +688,14 @@ export default function Home() {
                         >
                           {stock.classification}
                         </span>
+                        {stock.ross_eligible && (
+                          <span
+                            className="ml-1.5 inline-block rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-xs font-medium text-cyan-300"
+                            title={`VERAR momentum candidate ($1–$10, +10%, 5x RVOL). Unverified: ${stock.ross_unverified.join(", ")}`}
+                          >
+                            VERAR
+                          </span>
+                        )}
                       </td>
                       <td className="py-3 text-right tabular-nums">
                         {stock.last_price !== null
@@ -1116,7 +1136,7 @@ export default function Home() {
                   <table className="w-full text-left text-xs">
                     <thead>
                       <tr className="border-b border-white/10 text-slate-400">
-                        {["Entry", "Price", "Shares", "Exit", "Price", "Reason", "Net P/L"].map((h) => (
+                        {["Entry", "Entry Price", "Shares", "Exit", "Exit Price", "Reason", "Net P/L"].map((h) => (
                           <th key={h} className="px-2 py-2 font-medium">{h}</th>
                         ))}
                       </tr>

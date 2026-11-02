@@ -47,6 +47,9 @@ class ScannerConfig:
     min_baseline_sessions: int = 2
     momentum_window_min: int = 30
     stale_after_min: int = 10
+    # VERAR/Ross-style momentum candidate criteria (parallel classification).
+    ross_price_min: float = 1.0
+    ross_price_max: float = 10.0
     # Score-normalization caps (not hard gates).
     change_pct_cap: float = 0.10
     rvol_cap: float = 5.0
@@ -75,6 +78,9 @@ class HotStock:
     classification: str  # eligible | research | filtered | unavailable
     reasons: tuple[str, ...]
     research_eligible: bool  # passes all evaluable gates for this session
+    ross_eligible: bool  # meets all verifiable Ross-style criteria
+    ross_fails: tuple[str, ...]  # which Ross criteria failed
+    ross_unverified: tuple[str, ...]  # criteria we cannot check (float, news)
     bar_status: str  # live | session_ended | stale | none
     bar_age_min: float | None
     bar_freshness: str  # legacy: fresh | stale | none
@@ -149,6 +155,31 @@ def _score(
     return round(100 * sum(w * v for w, v in parts) / total_weight, 1)
 
 
+# Ross-style small-cap momentum criteria — evaluated in parallel to the
+# generic eligibility gates, not merged into them. Float and verifiable
+# news catalysts have no reliable source wired today, so they are
+# reported as unverified rather than passed/failed.
+ROSS_MIN_CHANGE_PCT = 10.0
+ROSS_MIN_RVOL = 5.0
+ROSS_UNVERIFIED = ("float <10M (no reliable source)", "news catalyst (no source wired)")
+
+
+def _ross_check(
+    last_price: float | None,
+    change_pct: float | None,
+    rvol: float | None,
+    config: "ScannerConfig",
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    fails = []
+    if last_price is None or not (config.ross_price_min <= last_price <= config.ross_price_max):
+        fails.append(f"price outside ${config.ross_price_min:.0f}–${config.ross_price_max:.0f}")
+    if change_pct is None or change_pct * 100 < ROSS_MIN_CHANGE_PCT:
+        fails.append(f"daily gain below +{ROSS_MIN_CHANGE_PCT:.0f}%")
+    if rvol is None or rvol < ROSS_MIN_RVOL:
+        fails.append(f"rvol below {ROSS_MIN_RVOL:.0f}x")
+    return not fails, tuple(fails), ROSS_UNVERIFIED
+
+
 def _bar_status(
     as_of: datetime | None,
     session_info: MarketSessionInfo,
@@ -201,7 +232,9 @@ def _evaluate(
     if not today_bars:
         return HotStock(
             symbol, None, None, None, 0, 0.0, None, None, None,
-            "unavailable", ("no intraday bars",), False, "none", None, "none", False, None,
+            "unavailable", ("no intraday bars",), False,
+            False, ("no data",), ROSS_UNVERIFIED,
+            "none", None, "none", False, None,
         )
 
     as_of = today_bars[-1].timestamp
@@ -213,7 +246,8 @@ def _evaluate(
     if not last_price or last_price <= 0:
         return HotStock(
             symbol, last_price, None, None, cum_volume, dollar_volume, None,
-            None, None, "unavailable", ("no usable price",), False, bar_status,
+            None, None, "unavailable", ("no usable price",), False,
+            False, ("no usable price",), ROSS_UNVERIFIED, bar_status,
             bar_age_min, "fresh" if bar_status in ("live", "session_ended") else bar_status,
             False, as_of,
         )
@@ -266,10 +300,16 @@ def _evaluate(
     else:
         classification = "research"
 
+    ross_eligible, ross_fails, ross_unverified = _ross_check(
+        last_price, change_pct, rvol, config
+    )
+
     return HotStock(
         symbol, last_price, change_pct, rvol, cum_volume, dollar_volume,
         momentum_pct, spread_bps, score, classification, tuple(reasons),
-        classification in ("eligible", "research"), bar_status, bar_age_min,
+        classification in ("eligible", "research"),
+        ross_eligible, ross_fails, ross_unverified,
+        bar_status, bar_age_min,
         "fresh" if bar_status in ("live", "session_ended") else bar_status,
         quote_available, as_of,
     )
