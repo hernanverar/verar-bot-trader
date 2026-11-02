@@ -46,3 +46,44 @@ def test_vwap_skips_zero_volume_keeps_last():
 
 def test_vwap_empty_input():
     assert session_vwap([]) == []
+
+
+def test_rth_vwap_excludes_premarket():
+    from app.chart_data import rth_vwap
+    from datetime import time as t
+
+    times = {DAY.date(): (t(9, 30), t(16, 0))}
+    bars = [
+        bar(-30, 12.0, 11.0, 11.5, 9999),  # 9:00 premarket — excluded
+        bar(0, 10.2, 9.9, 10.0, 100),       # 9:30 first RTH bar
+        bar(30, 10.4, 10.0, 10.3, 300),
+    ]
+    out = rth_vwap(bars, times)
+    # Premarket bar never enters the accumulation.
+    assert out[0][1] == pytest.approx(10.0333, abs=0.001)
+
+
+def test_rth_vwap_early_close_boundary():
+    from app.chart_data import rth_vwap
+    from datetime import time as t
+
+    times = {DAY.date(): (t(9, 30), t(13, 0))}  # early close
+    inside = bar(200, 10.2, 9.9, 10.0, 100)     # 12:50 -> included
+    outside = bar(220, 20.0, 19.0, 19.5, 999)   # 13:10 -> after close, excluded
+    out = rth_vwap([inside, outside], times)
+    assert len(out) == 1 and out[0][1] == pytest.approx(10.0333, abs=0.001)
+
+
+def test_rth_vwap_missing_calendar_day():
+    from app.chart_data import rth_vwap
+    # Bar date absent from calendar -> excluded, never guessed.
+    assert rth_vwap([bar(0, 10.2, 9.9, 10.0, 100)], {}) == []
+
+
+def test_rth_vwap_zero_volume_keeps_last():
+    from app.chart_data import rth_vwap
+    from datetime import time as t
+
+    times = {DAY.date(): (t(9, 30), t(16, 0))}
+    out = rth_vwap([bar(0, 10.2, 9.9, 10.0, 100), bar(1, 50.0, 49.0, 49.5, 0)], times)
+    assert out[1][1] == pytest.approx(10.0333, abs=0.001)

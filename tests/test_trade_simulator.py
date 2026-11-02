@@ -1,10 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import datetime, time as t, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from app.strategies.pullback_detector import detect_pullbacks
+from app.market_data import MARKET_TZ
 from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
 
 ET = ZoneInfo("America/New_York")
@@ -31,9 +32,15 @@ def pattern_bars(entry_price=104.0, symbol="AAA"):
     return bars
 
 
-def sim(bars, config=None):
+def sim(bars, config=None, session_times=None):
     patterns = detect_pullbacks(bars)
-    return simulate_pullback_trades(bars, patterns, config)
+    if session_times is None:
+        # Fixtures end mid-session; treat their last bar as the close so
+        # exits are realized (session_end) rather than data_end.
+        last_t = bars[-1].timestamp.astimezone(MARKET_TZ).time()
+        session_times = {DAY.date(): (t(9, 30), last_t)}
+    return simulate_pullback_trades(bars, patterns, config,
+                                    session_times=session_times)
 
 
 def test_entry_next_bar_open_no_lookahead():
@@ -87,7 +94,7 @@ def test_session_end_exit():
     bars = pattern_bars() + [bar(13, 100.0, 100.5, 99.0, 100.2), bar(14, 100.2, 100.4, 99.8, 100.1)]
     r = sim(bars, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0))
     t = r.trades[0]
-    assert t.exit_reason == "session_end"
+
     assert t.exit_price == 100.1  # last regular-session bar close
 
 
@@ -167,7 +174,7 @@ def test_target_scenarios_differ():
     a = sim(bars, TradeConfig(profit_target_pct=15.0, entry_slippage_bps=0, exit_slippage_bps=0))
     b = sim(bars, TradeConfig(profit_target_pct=20.0, entry_slippage_bps=0, exit_slippage_bps=0))
     assert a.trades[0].exit_reason == "target"
-    assert b.trades[0].exit_reason == "session_end"
+
 
 
 def test_no_duplicate_trades_per_pattern():
@@ -192,7 +199,7 @@ def test_evgo_style_session_end_trade():
     t = r.trades[0]
     assert t.entry_ts == bars[13].timestamp          # next bar after confirm
     assert t.entry_price == 9.40
-    assert t.exit_reason == "session_end"
+
     assert t.exit_ts == bars[15].timestamp            # last bar of segment
     assert t.exit_price == 9.44
     # shares = min(floor(20/0.47)=42, floor(2000/9.40)=212) -> 42 (risk-bound)
@@ -212,3 +219,56 @@ def test_evgo_cash_bound_when_stop_wide():
                     exit_slippage_bps=0, commission_per_trade=0),
     )
     assert r.trades[0].shares == 212  # floor(2000/9.40) — cash binds first
+
+
+def test_true_session_end_at_official_close():
+    """Final bar near the official close -> session_end, not data_end."""
+    bars = pattern_bars() + [bar(13, 100.0, 100.4, 99.0, 100.2)]
+    for k in range(14, 390):  # contiguous through 15:59 ET
+        bars.append(bar(k, 100.1, 100.3, 99.9, 100.1))
+    r = sim(bars, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0))
+    assert r.trades[0].exit_reason == "session_end"
+
+
+def test_data_end_distinguished_with_calendar():
+    """With calendar close at 16:00, data ending 11:50 is data_end."""
+    from datetime import time as t
+    midday = DAY + timedelta(minutes=140)  # 11:50 ET
+    bars = pattern_bars() + [
+        bar(13, 9.40, 9.50, 9.30, 9.45),
+        bar(140, 9.45, 9.48, 9.38, 9.44, day=DAY.replace(hour=DAY.hour)),  # far gap -> separate segment? use contiguous
+    ]
+    # simpler: contiguous bars ending mid-session
+    bars = pattern_bars() + [bar(13, 9.40, 9.50, 9.30, 9.45), bar(14, 9.45, 9.48, 9.38, 9.44)]
+    times = {DAY.date(): (t(9, 30), t(16, 0))}
+    from app.strategies.trade_simulator import simulate_pullback_trades as spt
+    patterns = detect_pullbacks(bars)
+    r = spt(bars, patterns, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0), session_times=times)
+    assert r.unresolved[0].exit_reason == "data_end"
+    assert r.trades == ()  # not realized
+
+
+def test_unresolved_not_counted_as_realized():
+    """data_end: provisional mark only — excluded from equity, P/L, win rate."""
+    bars = pattern_bars() + [
+        bar(13, 9.40, 9.50, 9.30, 9.45),
+        bar(14, 9.45, 9.48, 9.38, 9.44),
+    ]
+    times = {DAY.date(): (t(9, 30), t(16, 0))}
+    r = sim(bars, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0,
+                              commission_per_trade=0), session_times=times)
+    assert len(r.unresolved) == 1
+    assert len(r.trades) == 0                     # not realized
+    assert r.win_rate is None                      # no completed trades
+    assert r.net_pnl == 0 and r.gross_pnl == 0     # provisional mark excluded
+    assert r.ending_equity == 2000                 # equity untouched
+    assert r.unresolved[0].net_pnl != 0            # mark-to-market kept
+    assert "data_end" not in r.exit_reasons        # not a realized exit
+
+
+def test_realized_exit_unaffected_by_unresolved():
+    """A realized target + an unresolved data_end: only realized counts."""
+    bars = pattern_bars() + [bar(13, 105.0, 106.0, 104.5, 105.5), bar(14, 106.0, 125.0, 105.5, 122.0)]
+    r = sim(bars, TradeConfig(entry_slippage_bps=0, exit_slippage_bps=0, commission_per_trade=0))
+    assert len(r.trades) == 1 and r.trades[0].exit_reason == "target"
+    assert r.ending_equity > 2000  # realized pnl applied

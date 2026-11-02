@@ -2,6 +2,7 @@
 "use client";
 
 import { useRef, useState } from "react";
+import Link from "next/link";
 import {
   Activity,
   ArrowDownRight,
@@ -675,7 +676,13 @@ export default function Home() {
                       className="border-b border-white/5"
                     >
                       <td className="py-3 font-semibold">
-                        {stock.symbol}
+                        <Link
+                          href={`/terminal?symbol=${stock.symbol}`}
+                          className="text-blue-400 transition hover:text-blue-300 hover:underline"
+                          title={`Open ${stock.symbol} in Trading Terminal`}
+                        >
+                          {stock.symbol}
+                        </Link>
                         {stock.reasons.length > 0 && (
                           <p className="mt-0.5 max-w-64 text-xs font-normal text-slate-500">
                             {stock.reasons.join("; ")}

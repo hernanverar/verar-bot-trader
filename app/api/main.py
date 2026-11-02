@@ -14,7 +14,7 @@ from app.market_data import _data_feed, get_data_client
 from app.market_session import _fetch_trading_days
 from app.strategies.pullback_detector import PullbackConfig, detect_pullbacks
 from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
-from app.chart_data import session_vwap
+from app.chart_data import rth_vwap, session_vwap
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from app.strategies.hot_stock_scanner import ScannerConfig, scan_hot_stocks
@@ -312,6 +312,11 @@ def chart_bars(
     except RuntimeError:
         trading_client = None
     session_info = get_market_session(now=now, trading_client=trading_client)
+    cal = _fetch_trading_days(
+        trading_client,
+        (now - timedelta(days=days + 5)).date(),
+        now.date(),
+    )
 
     return {
         "symbol": symbol,
@@ -321,6 +326,11 @@ def chart_bars(
         "market_session": session_info.session,
         "market_is_open": session_info.is_open,
         "last_data_ts": int(complete[-1].timestamp.timestamp()) if complete else None,
+        "vwap_verified": cal is not None,
+        "rth_vwap": [
+            {"time": int(ts.timestamp()), "value": round(v, 4)}
+            for ts, v in (rth_vwap(complete, cal) if cal is not None else [])
+        ],
         "vwap": [
             {"time": int(ts.timestamp()), "value": round(v, 4)}
             for ts, v in session_vwap(complete)
@@ -376,7 +386,7 @@ def pullback_simulation(
         stop_loss_pct=stop_loss_pct,
         profit_target_pct=profit_target_pct,
     )
-    result = simulate_pullback_trades(bars, patterns, config)
+    result = simulate_pullback_trades(bars, patterns, config, session_times=trading_days)
 
     return {
         "symbol": symbol,
@@ -391,6 +401,7 @@ def pullback_simulation(
         "bars_analyzed": len(bars),
         "patterns_confirmed": result.patterns_confirmed,
         "trades_entered": len(result.trades),
+        "unresolved_count": len(result.unresolved),
         "skipped": [[ts.isoformat(), reason] for ts, reason in result.skipped],
         "win_rate": result.win_rate,
         "gross_pnl": result.gross_pnl,
@@ -399,4 +410,5 @@ def pullback_simulation(
         "max_drawdown": result.max_drawdown,
         "exit_reasons": result.exit_reasons,
         "trades": [asdict(t) for t in result.trades],
+        "unresolved": [asdict(t) for t in result.unresolved],
     }

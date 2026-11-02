@@ -26,6 +26,14 @@ export type OhlcvBar = {
 
 export type VwapPoint = { time: number; value: number };
 
+export type TradeMark = {
+  time: number;
+  kind: "entry" | "exit_target" | "exit_stop" | "exit_session" | "exit_other";
+  label: string;
+};
+
+export type PriceLine = { price: number; color: string; title: string };
+
 const ET_TIME = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York",
   hour: "2-digit",
@@ -118,23 +126,60 @@ function sessionMarkers(bars: OhlcvBar[]): SeriesMarker<UTCTimestamp>[] {
  * sharing the chart's single time axis. Incremental refreshes append
  * via series.update() so zoom/scroll are preserved; full reloads happen
  * only on symbol/interval changes. */
+const MARK_STYLE: Record<TradeMark["kind"], { color: string; position: "aboveBar" | "belowBar"; shape: "arrowUp" | "arrowDown" }> = {
+  entry: { color: "#22c55e", position: "belowBar", shape: "arrowUp" },
+  exit_target: { color: "#22c55e", position: "aboveBar", shape: "arrowDown" },
+  exit_stop: { color: "#ef4444", position: "aboveBar", shape: "arrowDown" },
+  exit_session: { color: "#94a3b8", position: "aboveBar", shape: "arrowDown" },
+  exit_other: { color: "#f59e0b", position: "aboveBar", shape: "arrowDown" },
+};
+
+/** Bars per ET session for initial viewport sizing. */
+function lastSessionBars(bars: OhlcvBar[]): number {
+  if (!bars.length) return 0;
+  const lastDay = etDay(bars[bars.length - 1].time);
+  let n = 0;
+  for (let i = bars.length - 1; i >= 0 && etDay(bars[i].time) === lastDay; i--) n++;
+  return n;
+}
+
+const ET_DAY = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+const etDay = (ts: number) => ET_DAY.format(ts * 1000);
+
 export default function CandleChart({
   bars,
   vwap = [],
+  rthVwap = [],
   showVwap = false,
+  showRthVwap = false,
+  tradeMarks = [],
+  priceLines = [],
+  focusRange = null,
 }: {
   bars: OhlcvBar[];
   vwap?: VwapPoint[];
+  rthVwap?: VwapPoint[];
   showVwap?: boolean;
+  showRthVwap?: boolean;
+  tradeMarks?: TradeMark[];
+  priceLines?: PriceLine[];
+  focusRange?: { from: number; to: number } | null;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const seriesRef = useRef<{
     candles: ISeriesApi<"Candlestick"> | null;
     volume: ISeriesApi<"Histogram"> | null;
     vwap: ISeriesApi<"Line"> | null;
+    rth: ISeriesApi<"Line"> | null;
     lastBar: OhlcvBar | null;
     lastVwap: VwapPoint | null;
-  }>({ candles: null, volume: null, vwap: null, lastBar: null, lastVwap: null });
+  }>({ candles: null, volume: null, vwap: null, rth: null, lastBar: null, lastVwap: null });
+  const priceLinesRef = useRef<{ remove(): void }[]>([]);
   const firstBarTimeRef = useRef<number | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
 
@@ -151,7 +196,12 @@ export default function CandleChart({
     );
     const vwapLine = chart.addSeries(
       LineSeries,
-      { color: "#f59e0b", lineWidth: 1, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: true },
+      { color: "#f59e0b", lineWidth: 1, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: true, title: "VWAP" },
+      0,
+    );
+    const rthLine = chart.addSeries(
+      LineSeries,
+      { color: "#06b6d4", lineWidth: 1, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: true, title: "RTH VWAP", lineStyle: 2 },
       0,
     );
     const volumePane = chart.addPane();
@@ -159,13 +209,14 @@ export default function CandleChart({
     chart.panes()[0].setStretchFactor(0.75);
     const volume = chart.addSeries(HistogramSeries, { priceFormat: { type: "volume" } }, 1);
 
-    seriesRef.current = { candles, volume, vwap: vwapLine, lastBar: null, lastVwap: null };
+    seriesRef.current = { candles, volume, vwap: vwapLine, rth: rthLine, lastBar: null, lastVwap: null };
+    priceLinesRef.current = [];
     createSeriesMarkers(candles, []);
 
     return () => {
       chart.remove();
       chartRef.current = null;
-      seriesRef.current = { candles: null, volume: null, vwap: null, lastBar: null, lastVwap: null };
+      seriesRef.current = { candles: null, volume: null, vwap: null, rth: null, lastBar: null, lastVwap: null };
     };
   }, []);
 
@@ -185,8 +236,8 @@ export default function CandleChart({
   // Data updates — incremental append when possible, full reset on
   // symbol/interval change so stale candles never linger.
   useEffect(() => {
-    const { candles, volume, vwap: vwapSeries, lastBar, lastVwap } = seriesRef.current;
-    if (!candles || !volume || !vwapSeries) return;
+    const { candles, volume, vwap: vwapSeries, rth: rthSeries, lastBar, lastVwap } = seriesRef.current;
+    if (!candles || !volume || !vwapSeries || !rthSeries) return;
 
     const isAppend =
       lastBar !== null &&
@@ -207,6 +258,8 @@ export default function CandleChart({
         vwapSeries.update({ time: toUtc(nv.time), value: nv.value });
         seriesRef.current.lastVwap = nv;
       }
+      const nr = rthVwap[rthVwap.length - 1];
+      if (nr) rthSeries.update({ time: toUtc(nr.time), value: nr.value });
       seriesRef.current.lastBar = bars[bars.length - 1];
       return;
     }
@@ -217,24 +270,74 @@ export default function CandleChart({
     );
     volume.setData(bars.map(volumePoint));
     vwapSeries.setData(vwap.map((p) => ({ time: toUtc(p.time), value: p.value })));
+    rthSeries.setData(rthVwap.map((p) => ({ time: toUtc(p.time), value: p.value })));
     seriesRef.current.lastBar = bars[bars.length - 1] ?? null;
     seriesRef.current.lastVwap = vwap[vwap.length - 1] ?? null;
     firstBarTimeRef.current = bars[0]?.time ?? null;
     if (bars.length > 0) {
-      chartRef.current?.timeScale().fitContent();
+      // Default viewport: the most recent trading session; earlier
+      // history stays reachable by scrolling left.
+      const lastCount = Math.max(1, lastSessionBars(bars));
+      chartRef.current?.timeScale().setVisibleLogicalRange({
+        from: bars.length - lastCount,
+        to: bars.length + 2,
+      });
     }
-  }, [bars, vwap]);
+  }, [bars, vwap, rthVwap]);
 
-  // Re-render markers whenever the bar set changes materially.
-  useEffect(() => {
-    const { candles } = seriesRef.current;
-    if (candles) createSeriesMarkers(candles, sessionMarkers(bars));
-  }, [bars]);
-
-  // VWAP visibility toggle.
+  // VWAP visibility toggles.
   useEffect(() => {
     seriesRef.current.vwap?.applyOptions({ visible: showVwap });
   }, [showVwap]);
+  useEffect(() => {
+    seriesRef.current.rth?.applyOptions({ visible: showRthVwap });
+  }, [showRthVwap]);
+
+  // Session + trade markers.
+  useEffect(() => {
+    const { candles } = seriesRef.current;
+    if (!candles) return;
+    const barTimes = new Set(bars.map((b) => b.time));
+    const trade = tradeMarks
+      .filter((m) => barTimes.has(m.time))
+      .map((m) => ({
+        time: toUtc(m.time),
+        position: MARK_STYLE[m.kind].position,
+        color: MARK_STYLE[m.kind].color,
+        shape: MARK_STYLE[m.kind].shape,
+        text: m.label,
+        size: 1,
+      }));
+    createSeriesMarkers(candles, [...sessionMarkers(bars), ...trade]);
+  }, [bars, tradeMarks]);
+
+  // Horizontal price lines for the selected trade.
+  useEffect(() => {
+    const { candles } = seriesRef.current;
+    if (!candles) return;
+    for (const l of priceLinesRef.current) candles.removePriceLine(l as never);
+    priceLinesRef.current = priceLines.map((l) =>
+      candles.createPriceLine({
+        price: l.price,
+        color: l.color,
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: l.title,
+      }) as unknown as { remove(): void },
+    );
+  }, [priceLines]);
+
+  // Focus a trade's entry→exit span only when the user selects it —
+  // never on periodic refresh, and manual zoom/scroll remains free after.
+  useEffect(() => {
+    if (!focusRange || !chartRef.current) return;
+    const pad = 6;
+    chartRef.current.timeScale().setVisibleLogicalRange({
+      from: focusRange.from - pad,
+      to: focusRange.to + pad,
+    });
+  }, [focusRange]);
 
   return <div ref={containerRef} className="h-[480px] w-full" />;
 }
