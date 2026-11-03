@@ -22,6 +22,7 @@ from app.chart_data import rth_vwap, session_vwap
 from app.research_snapshots import load_snapshot, list_versions, snapshot_hash, ROOT as RESEARCH_ROOT
 from pathlib import Path
 import json as _json
+import os
 from app.strategies.momentum_detector import MomentumSetupConfig, detect_momentum_setups
 from app.strategies.momentum_simulator import lifecycle_status, simulate_momentum_setups
 from app import alert_store
@@ -929,3 +930,112 @@ def replay_bars(symbol: str = Query(..., min_length=1, max_length=10),
         "note": "historical replay — not live trading",
         "bars": bars,
     }
+
+
+# ---- Phase 4B: premarket scanner (free IEX, research only) ----------------
+
+@app.get("/api/scanner/premarket")
+def premarket_scanner(
+    symbols: str | None = Query(default=None),
+    use_screener: bool = Query(default=True),
+    baseline_days: int = Query(default=5, ge=1, le=15),
+):
+    """Premarket momentum monitor — research data, free IEX only.
+    Volume is partial IEX, never consolidated."""
+    from app.premarket_scanner import (
+        PremarketCfg, discover_symbols, symbol_metrics,
+        elapsed_window, pm_bounds, prev_rth_close,
+        baseline_volumes, MIN_BASELINE_VOLUME)
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+    now = datetime.now(ET)
+    today = now.date()
+    cfg = PremarketCfg(baseline_days=baseline_days)
+    try:
+        dc = get_data_client()
+        tc = get_trading_client()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"data client unavailable: {exc}") from exc
+
+    trading_days = _fetch_trading_days(
+        tc, today - timedelta(days=baseline_days * 3), today)
+    sessions = sorted(trading_days.keys()) if trading_days else []
+    in_pm = pm_bounds(today)[0] <= now < pm_bounds(today)[1]
+    pm_done = now >= pm_bounds(today)[1]
+    if today not in (sessions or [today]) or (not in_pm and not pm_done):
+        return {"market": "premarket_not_active", "note":
+                "outside 04:00-09:29 ET or non-trading day", "rows": [],
+                "feed": "iex", "checked_at": now.isoformat()}
+
+    watch = [s.strip().upper() for s in symbols.split(",")] if symbols else []
+    rows, disc_err = discover_symbols(
+        (lambda: _most_actives()) if use_screener else (lambda: []),
+        watch)
+    results = {"market": "premarket", "feed": "iex", "checked_at": now.isoformat(),
+               "in_window": in_pm, "discovery_errors": disc_err,
+               "notes": ["volumes/RVOL are IEX-partial, not consolidated",
+                         "prev_close is IEX daily close approximation, not official",
+                         "api_calls counts logical batched requests; SDK paginates internally"],
+               "api_calls": {"screener": 1 if use_screener else 0,
+                             "daily": 0, "minute": 0, "baseline": 0},
+               "rows": []}
+    if not rows:
+        return results
+
+    try:
+        daily_req = StockBarsRequest(
+            symbol_or_symbols=[s for s, _ in rows], timeframe=TimeFrame.Day,
+            start=now - timedelta(days=baseline_days * 3 + 10), end=now,
+            feed="iex")
+        daily = dc.get_stock_bars(daily_req).data
+        results["api_calls"]["daily"] += 1
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"daily bars failed: {exc}") from exc
+
+    start, _ = elapsed_window(today, now)
+    try:
+        pm_req = StockBarsRequest(
+            symbol_or_symbols=[s for s, _ in rows], timeframe=TimeFrame.Minute,
+            start=start, end=now, feed="iex")
+        pm = dc.get_stock_bars(pm_req).data
+        results["api_calls"]["minute"] += 1
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"premarket bars failed: {exc}") from exc
+
+    try:
+        hist_req = StockBarsRequest(
+            symbol_or_symbols=[s for s, _ in rows], timeframe=TimeFrame.Minute,
+            start=now - timedelta(days=baseline_days * 3),
+            end=pm_bounds(today)[0], feed="iex")
+        hist = dc.get_stock_bars(hist_req).data
+        results["api_calls"]["baseline"] += 1
+    except Exception as exc:
+        hist = {}
+        results["discovery_errors"]["baseline"] = str(exc)[:120]
+
+    for sym, src in rows:
+        pm_bars = [b for b in pm.get(sym, [])
+                   if pm_bounds(today)[0] <= b.timestamp < pm_bounds(today)[1]]
+        pc, pcd = prev_rth_close(daily.get(sym, []), sessions, today)
+        byday: dict[str, list] = {}
+        for b in hist.get(sym, []):
+            byday.setdefault(b.timestamp.date().isoformat(), []).append(b)
+        bases = baseline_volumes(byday, sessions, today, now, baseline_days)
+        m = symbol_metrics(pm_bars, pc, pcd, bases, now, cfg)
+        results["rows"].append({"symbol": sym, "source": src, **m})
+    return results
+
+
+def _most_actives() -> list[dict]:
+    """Raw REST screener — free tier, ~1 call."""
+    import requests as _req
+    key = os.getenv("ALPACA_API_KEY"); sec = os.getenv("ALPACA_SECRET_KEY")
+    if not key or not sec:
+        return []
+    r = _req.get(
+        "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives",
+        params={"by": "volume", "top": 25},
+        headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+        timeout=15)
+    r.raise_for_status()
+    return r.json().get("most_actives", [])
