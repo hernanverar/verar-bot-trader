@@ -195,3 +195,49 @@ def load_universe_symbols() -> list[str]:
     if not files:
         return []
     return json.loads(files[-1].read_text())["symbols"]
+
+
+# ---- broad-scan cache + concurrency guard --------------------------------
+import threading
+_SCAN_TTL = 240.0          # 4 min — broad discovery cadence
+_scan_state = {"ts": None, "result": None, "key": None}
+_scan_lock = threading.Lock()
+_scan_inflight = threading.Event()
+_scan_inflight.set()
+
+
+def cached_gap_scan(fetch, key=None, now_fn=None,
+                    ttl: float = _SCAN_TTL) -> dict:
+    """Run `fetch()` at most once per `ttl` per `key` (session date +
+    discovery params). A key change invalidates the cache immediately —
+    yesterday's results are never served for today.
+    Concurrent callers share the in-flight scan."""
+    import time as _t
+    now_fn = now_fn or _t.monotonic
+    while True:
+        with _scan_lock:
+            ts = _scan_state["ts"]
+            if (ts is not None and _scan_state["key"] == key
+                    and now_fn() - ts < ttl):
+                return {"result": _scan_state["result"], "cached": True,
+                        "cache_age_s": round(now_fn() - ts, 1)}
+            if _scan_inflight.is_set():
+                _scan_inflight.clear()
+                break
+        if not _scan_inflight.wait(timeout=60):
+            raise TimeoutError("broad scan in-flight timeout")
+    try:
+        result = fetch()
+        with _scan_lock:
+            _scan_state["ts"] = now_fn()
+            _scan_state["result"] = result
+            _scan_state["key"] = key
+        return {"result": result, "cached": False, "cache_age_s": 0.0}
+    finally:
+        _scan_inflight.set()
+
+
+def _reset_scan_cache() -> None:
+    _scan_state["ts"], _scan_state["result"] = None, None
+    _scan_state["key"] = None
+    _scan_inflight.set()

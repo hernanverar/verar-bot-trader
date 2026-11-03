@@ -169,6 +169,23 @@ export default function Home() {
   const [scanAsOf, setScanAsOf] = useState("");
   const [eligibleOnly, setEligibleOnly] = useState(false);
   const [scanMode, setScanMode] = useState<"auto" | "manual">("auto");
+  const [marketMode, setMarketMode] = useState<"regular" | "premarket">("regular");
+  const [pmRows, setPmRows] = useState<Record<string, any>[] | null>(null);
+  const [pmMeta, setPmMeta] = useState<any>(null);
+  const [pmLoading, setPmLoading] = useState(false);
+  const [pmError, setPmError] = useState("");
+  const [pmSort, setPmSort] = useState<"gap_pct" | "last" | "pm_volume" | "age_s">("gap_pct");
+
+  const loadPremarket = async (scan = false) => {
+    setPmLoading(true); setPmError("");
+    try {
+      const r = await fetch(`/api/scanner/premarket${scan ? "?scan=true" : ""}`);
+      const j = await r.json();
+      if (!r.ok) { setPmError(j.detail || j.error || "Scan failed"); setPmRows(null); return; }
+      setPmRows(j.rows || []); setPmMeta(j);
+    } catch { setPmError("Premarket API unavailable"); }
+    finally { setPmLoading(false); }
+  };
   const [manualSymbols, setManualSymbols] = useState("");
   const [pbSymbol, setPbSymbol] = useState("");
   const [pbPatterns, setPbPatterns] = useState<PullbackPattern[] | null>(null);
@@ -503,6 +520,69 @@ export default function Home() {
           )}
         </section>
 
+        <div className="flex items-center gap-2">
+          {(["regular", "premarket"] as const).map((m) => (
+            <button key={m} onClick={() => {
+                setMarketMode(m);
+                if (m === "premarket" && pmRows === null) loadPremarket(); }}
+              className={`rounded px-3 py-1 text-xs font-medium ${
+                marketMode === m ? "bg-cyan-600" : "bg-[#111b2d] text-slate-400"}`}>
+              {m === "regular" ? "Regular" : "Premarket"}</button>
+          ))}
+          {marketMode === "premarket" && (
+            <>
+              <button onClick={() => loadPremarket()} className="rounded bg-[#111b2d] px-3 py-1 text-xs">Refresh</button>
+              <button onClick={() => loadPremarket(true)} className="rounded bg-emerald-700 px-3 py-1 text-xs">
+                Scan broad universe</button>
+              <span className="rounded bg-amber-900/40 px-2 py-1 text-[10px] text-amber-300">
+                IEX PARTIAL — not consolidated</span>
+            </>)}
+        </div>
+        {marketMode === "premarket" && (
+        <section className="rounded-2xl border border-white/10 bg-[#111b2d] p-6">
+          <div className="mb-4 flex items-center justify-between">
+            <h3 className="text-lg font-semibold">Premarket Momentum — IEX Partial</h3>
+          </div>
+          {pmMeta?.market === "premarket_not_active" && (
+            <p className="text-sm text-slate-400">Outside the 04:00–09:29 ET premarket window — monitoring resumes next session.</p>)}
+          {pmMeta?.scan && pmMeta.scan.requests > 0 && (
+            <p className="mb-3 text-xs text-slate-400">
+              Broad scan: {pmMeta.scan.scanned} scanned · {pmMeta.scan.candidates} candidates
+              {pmMeta.scan.cached ? ` · cached ${pmMeta.scan.cache_age_s}s ago` : " · fresh"}</p>)}
+          {pmError && <p className="text-sm text-red-400">{pmError}</p>}
+          {pmLoading && <p className="text-sm text-slate-400">Loading…</p>}
+          {pmRows && pmRows.length === 0 && !pmLoading && !pmError && (
+            <p className="text-sm text-slate-400">No symbols monitored — try “Scan broad universe”.</p>)}
+          {pmRows && pmRows.length > 0 && (
+            <table className="w-full text-left text-sm">
+              <thead className="text-xs text-slate-500">
+                <tr>
+                  <th className="cursor-pointer pb-2" onClick={() => setPmSort("gap_pct")}>gap%</th>
+                  <th>symbol</th><th>src</th>
+                  <th className="cursor-pointer" onClick={() => setPmSort("last")}>last</th>
+                  <th className="cursor-pointer" onClick={() => setPmSort("pm_volume")}>pm vol</th>
+                  <th>hi/lo</th><th>rvol</th><th className="cursor-pointer" onClick={() => setPmSort("age_s")}>age</th>
+                  <th>status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...pmRows].sort((a, b) => (Number(b[pmSort]) || -1) - (Number(a[pmSort]) || -1)).map(r => (
+                  <tr key={`${r.symbol}|${r.source}`}
+                    className={r.qualified ? "text-emerald-400" : Number(r.gap_pct) >= 5 ? "text-amber-300" : "text-slate-400"}>
+                    <td className="py-0.5">{r.gap_pct != null ? `${r.gap_pct}%` : "—"}</td>
+                    <td className="font-mono">{String(r.symbol)}</td>
+                    <td className="text-xs">{String(r.source)}</td>
+                    <td>{r.last ?? "—"}</td>
+                    <td>{r.pm_volume != null ? Number(r.pm_volume).toLocaleString() : "—"}</td>
+                    <td className="text-xs">{r.pm_high ?? "—"}/{r.pm_low ?? "—"}</td>
+                    <td>{r.rvol != null ? `${r.rvol}×` : "—"}</td>
+                    <td className="text-xs">{r.age_s != null ? `${r.age_s}s` : "—"}</td>
+                    <td className="text-xs">{String(r.status)}</td>
+                  </tr>))}
+              </tbody>
+            </table>)}
+        </section>)}
+        {marketMode === "regular" && (
         <section className="rounded-2xl border border-white/10 bg-[#111b2d] p-6">
           <div className="mb-6 flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -544,7 +624,7 @@ export default function Home() {
 
           <div className="mb-6 flex flex-wrap items-center gap-3">
             <div className="flex rounded-lg border border-white/10 p-1 text-xs font-medium">
-              {(["auto", "manual"] as const).map((mode) => (
+              {marketMode === "regular" && (["auto", "manual"] as const).map((mode) => (
                 <button
                   key={mode}
                   onClick={() => setScanMode(mode)}
@@ -739,7 +819,7 @@ export default function Home() {
               </table>
             </div>
           )}
-        </section>
+        </section>)}
 
         {!result ? (
           <section className="rounded-2xl border border-dashed border-white/15 bg-[#111b2d]/50 px-6 py-20 text-center">

@@ -143,3 +143,43 @@ def test_gap_scan_rejects_stale_trades():
     assert [r["symbol"] for r in rows] == ["FRESH"]
     # without a window, OLD would pass -> validates the guard exists
     assert len(gap_scan(snaps, PremarketCfg())) == 3
+
+
+def test_scan_cache_ttl_and_concurrency():
+    from app.premarket_scanner import cached_gap_scan, _reset_scan_cache
+    _reset_scan_cache()
+    calls = []
+    t = [0.0]
+    def fetch(): calls.append(1); return {"stats": {"scanned": 1}, "found": []}
+    r1 = cached_gap_scan(fetch, now_fn=lambda: t[0])
+    r2 = cached_gap_scan(fetch, now_fn=lambda: t[0] + 10)
+    assert len(calls) == 1 and r1["cached"] is False and r2["cached"] is True
+    t[0] = 300.0
+    r3 = cached_gap_scan(fetch, now_fn=lambda: t[0], ttl=240)
+    assert r3["cached"] is False and len(calls) == 2
+    # concurrency: concurrent callers share in-flight result
+    _reset_scan_cache()
+    import threading, time
+    out = []
+    def slow(): import time; time.sleep(0.2); return {"stats": {}, "found": ["X"]}
+    t1 = threading.Thread(target=lambda: out.append(cached_gap_scan(slow)))
+    t2 = threading.Thread(target=lambda: out.append(cached_gap_scan(slow)))
+    t1.start(); time.sleep(0.05); t2.start(); t1.join(); t2.join()
+    # second caller waited for the in-flight scan
+    assert len(out) == 2
+
+
+def test_cache_key_invalidates_and_failure_recovers():
+    from app.premarket_scanner import cached_gap_scan, _reset_scan_cache
+    _reset_scan_cache()
+    n = [0]
+    def fetch(): n[0] += 1; return {"found": []}
+    cached_gap_scan(fetch, key="day1|g5")
+    assert cached_gap_scan(fetch, key="day1|g10")["cached"] is False  # new key
+    assert n[0] == 2
+    # failure releases in-flight -> next call retries fresh
+    def boom(): raise RuntimeError("api down")
+    _reset_scan_cache()
+    try: cached_gap_scan(boom, key="k")
+    except RuntimeError: pass
+    assert cached_gap_scan(fetch, key="k")["result"] == {"found": []}

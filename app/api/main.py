@@ -976,11 +976,16 @@ def premarket_scanner(
     rows, disc_err = discover_symbols(
         (lambda: _most_actives()) if use_screener else (lambda: []),
         watch)
-    scan_stats = {"universe": 0, "scanned": 0, "candidates": 0, "requests": 0}
+    scan_stats = {"universe": 0, "scanned": 0, "candidates": 0,
+                  "requests": 0, "cached": False, "cache_age_s": 0.0}
     if scan:
-        try:
+        from app.premarket_scanner import cached_gap_scan
+
+        def _do_scan():
+            st = {"universe": 0, "scanned": 0, "candidates": 0,
+                  "requests": 0, "errors": []}
             uni = load_universe_symbols()
-            scan_stats["universe"] = len(uni)
+            st["universe"] = len(uni)
             snaps = {}
             import time as _t
             for chunk in [uni[i:i+400] for i in range(0, len(uni), 400)]:
@@ -992,30 +997,37 @@ def premarket_scanner(
                             headers={"APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY"),
                                      "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY")},
                             timeout=30)
-                        scan_stats["requests"] += 1
+                        st["requests"] += 1
                         if rr.ok:
                             snaps.update(rr.json())
                             break
                         if rr.status_code == 429 and attempt == 0:
                             _t.sleep(2)
                             continue
-                        scan_stats.setdefault("errors", []).append(
-                            f"batch {rr.status_code}")
+                        st["errors"].append(f"batch {rr.status_code}")
                         break
                     except _req.RequestException as exc:
                         if attempt == 0:
                             _t.sleep(2)
                             continue
-                        scan_stats["requests"] += 1
-                        scan_stats.setdefault("errors", []).append(
-                            str(exc)[:80])
+                        st["requests"] += 1
+                        st["errors"].append(str(exc)[:80])
                         break
-            scan_stats["scanned"] = len(snaps)
+            st["scanned"] = len(snaps)
             found = gap_scan(snaps, cfg, discover_gap_pct=discover_gap,
                              valid_after=pm_bounds(today)[0])
-            scan_stats["candidates"] = len(found)
+            st["candidates"] = len(found)
+            return {"stats": st, "found": found}
+        try:
+            sr = cached_gap_scan(
+                _do_scan,
+                key=(today.isoformat(), discover_gap,
+                     cfg.price_min, cfg.price_max))
+            scan_stats.update(sr["result"]["stats"])
+            scan_stats["cached"] = sr["cached"]
+            scan_stats["cache_age_s"] = sr["cache_age_s"]
             seen = {s for s, _ in rows}
-            for f_ in found[:scan_max]:
+            for f_ in sr["result"]["found"][:scan_max]:
                 if f_["symbol"] not in seen:
                     rows.append((f_["symbol"], "gap_scan"))
                     seen.add(f_["symbol"])
