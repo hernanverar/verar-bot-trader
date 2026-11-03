@@ -7,6 +7,7 @@ premarket window vs >=3 prior sessions; never EOD RVOL.
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import date, datetime, timedelta, time
 from statistics import median
 from zoneinfo import ZoneInfo
@@ -156,3 +157,41 @@ def baseline_volumes(daily_pm: dict[str, list], sessions: list[date],
         if v:
             vols.append(v)
     return vols
+
+
+def gap_scan(snaps: dict, cfg: PremarketCfg,
+             discover_gap_pct: float = 5.0,
+             valid_after: datetime | None = None) -> list[dict]:
+    """Stage-1 discovery from bulk snapshots (latestTrade + prevDailyBar).
+    Cheap: price+gap per symbol with zero extra requests.
+    `valid_after` (tz-aware): only trades at/after this instant count as
+    current-session observations — a stale latestTrade never manufactures
+    a premarket gap."""
+    out = []
+    for sym, s in snaps.items():
+        lt, pdb = (s or {}).get("latestTrade") or {}, (s or {}).get("prevDailyBar") or {}
+        px, pc, ts = lt.get("p"), pdb.get("c"), lt.get("t")
+        if not px or not pc or not ts:
+            continue
+        if valid_after is not None:
+            try:
+                tt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if tt < valid_after:
+                    continue
+            except (ValueError, TypeError):
+                continue
+        gap = (px / pc - 1) * 100
+        if cfg.price_min <= px <= cfg.price_max and gap >= discover_gap_pct:
+            out.append({"symbol": sym, "source": "gap_scan", "price": px,
+                        "gap_pct": round(gap, 2), "trade_ts": ts})
+    return sorted(out, key=lambda r: -r["gap_pct"])
+
+
+def load_universe_symbols() -> list[str]:
+    """Small-cap-eligible symbols from the newest saved universe manifest."""
+    import json
+    d = Path(__file__).resolve().parent.parent / "data" / "research" / "universe"
+    files = sorted(d.glob("universe_*.json")) if d.is_dir() else []
+    if not files:
+        return []
+    return json.loads(files[-1].read_text())["symbols"]

@@ -111,3 +111,35 @@ def test_qualified_needs_price_and_gap_only():
     # out of price band -> not qualified
     m2 = symbol_metrics([bar(8, 0, c=15.0, v=10)], 4.0, DAY, [], now, PremarketCfg())
     assert m2["qualified"] is False
+
+
+def test_gap_scan_from_snapshots():
+    from app.premarket_scanner import gap_scan
+    snaps = {
+        "GOOD": {"latestTrade": {"p": 3.0, "t": "t1"}, "prevDailyBar": {"c": 2.0}},
+        "EXP":  {"latestTrade": {"p": 15.0, "t": "t1"}, "prevDailyBar": {"c": 10.0}},
+        "DOWN": {"latestTrade": {"p": 1.5, "t": "t1"}, "prevDailyBar": {"c": 2.0}},
+        "NOD":  {"latestTrade": None, "prevDailyBar": {"c": 2.0}},
+        "SMALL":{"latestTrade": {"p": 2.0, "t": "t1"}, "prevDailyBar": {"c": 1.95}},
+    }
+    rows = gap_scan(snaps, PremarketCfg(), discover_gap_pct=5.0)
+    syms = [r["symbol"] for r in rows]
+    assert syms == ["GOOD"]  # EXP out of band, DOWN negative, NOD none, SMALL 2.6%
+    assert rows[0]["gap_pct"] == 50.0 and rows[0]["source"] == "gap_scan"
+
+
+def test_gap_scan_rejects_stale_trades():
+    from app.premarket_scanner import gap_scan
+    pm_open = datetime(2026, 11, 3, 4, 0, tzinfo=ET)
+    snaps = {
+        "FRESH": {"latestTrade": {"p": 3.0, "t": "2026-11-03T13:30:00Z"},
+                  "prevDailyBar": {"c": 2.0}},
+        "OLD":   {"latestTrade": {"p": 3.0, "t": "2026-11-02T20:00:00Z"},  # yesterday
+                  "prevDailyBar": {"c": 2.0}},
+        "BADTS": {"latestTrade": {"p": 3.0, "t": "garbage"},
+                  "prevDailyBar": {"c": 2.0}},
+    }
+    rows = gap_scan(snaps, PremarketCfg(), valid_after=pm_open)
+    assert [r["symbol"] for r in rows] == ["FRESH"]
+    # without a window, OLD would pass -> validates the guard exists
+    assert len(gap_scan(snaps, PremarketCfg())) == 3

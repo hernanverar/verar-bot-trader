@@ -938,6 +938,9 @@ def replay_bars(symbol: str = Query(..., min_length=1, max_length=10),
 def premarket_scanner(
     symbols: str | None = Query(default=None),
     use_screener: bool = Query(default=True),
+    scan: bool = Query(default=False),
+    discover_gap: float = Query(default=5.0),
+    scan_max: int = Query(default=25, ge=1, le=100),
     baseline_days: int = Query(default=5, ge=1, le=15),
 ):
     """Premarket momentum monitor — research data, free IEX only.
@@ -945,7 +948,9 @@ def premarket_scanner(
     from app.premarket_scanner import (
         PremarketCfg, discover_symbols, symbol_metrics,
         elapsed_window, pm_bounds, prev_rth_close,
-        baseline_volumes, MIN_BASELINE_VOLUME)
+        baseline_volumes, gap_scan, load_universe_symbols,
+        MIN_BASELINE_VOLUME)
+    import requests as _req
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
     now = datetime.now(ET)
@@ -971,8 +976,54 @@ def premarket_scanner(
     rows, disc_err = discover_symbols(
         (lambda: _most_actives()) if use_screener else (lambda: []),
         watch)
+    scan_stats = {"universe": 0, "scanned": 0, "candidates": 0, "requests": 0}
+    if scan:
+        try:
+            uni = load_universe_symbols()
+            scan_stats["universe"] = len(uni)
+            snaps = {}
+            import time as _t
+            for chunk in [uni[i:i+400] for i in range(0, len(uni), 400)]:
+                for attempt in range(2):
+                    try:
+                        rr = _req.get(
+                            "https://data.alpaca.markets/v2/stocks/snapshots",
+                            params={"symbols": ",".join(chunk), "feed": "iex"},
+                            headers={"APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY"),
+                                     "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY")},
+                            timeout=30)
+                        scan_stats["requests"] += 1
+                        if rr.ok:
+                            snaps.update(rr.json())
+                            break
+                        if rr.status_code == 429 and attempt == 0:
+                            _t.sleep(2)
+                            continue
+                        scan_stats.setdefault("errors", []).append(
+                            f"batch {rr.status_code}")
+                        break
+                    except _req.RequestException as exc:
+                        if attempt == 0:
+                            _t.sleep(2)
+                            continue
+                        scan_stats["requests"] += 1
+                        scan_stats.setdefault("errors", []).append(
+                            str(exc)[:80])
+                        break
+            scan_stats["scanned"] = len(snaps)
+            found = gap_scan(snaps, cfg, discover_gap_pct=discover_gap,
+                             valid_after=pm_bounds(today)[0])
+            scan_stats["candidates"] = len(found)
+            seen = {s for s, _ in rows}
+            for f_ in found[:scan_max]:
+                if f_["symbol"] not in seen:
+                    rows.append((f_["symbol"], "gap_scan"))
+                    seen.add(f_["symbol"])
+        except Exception as exc:
+            disc_err["gap_scan"] = str(exc)[:120]
     results = {"market": "premarket", "feed": "iex", "checked_at": now.isoformat(),
                "in_window": in_pm, "discovery_errors": disc_err,
+               "scan": scan_stats,
                "notes": ["volumes/RVOL are IEX-partial, not consolidated",
                          "prev_close is IEX daily close approximation, not official",
                          "api_calls counts logical batched requests; SDK paginates internally"],
