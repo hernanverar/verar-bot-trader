@@ -19,6 +19,9 @@ from app.market_session import _fetch_trading_days
 from app.strategies.pullback_detector import PullbackConfig, detect_pullbacks
 from app.strategies.trade_simulator import TradeConfig, simulate_pullback_trades
 from app.chart_data import rth_vwap, session_vwap
+from app.research_snapshots import load_snapshot, list_versions, snapshot_hash, ROOT as RESEARCH_ROOT
+from pathlib import Path
+import json as _json
 from app.strategies.momentum_detector import MomentumSetupConfig, detect_momentum_setups
 from app.strategies.momentum_simulator import lifecycle_status, simulate_momentum_setups
 from app import alert_store
@@ -842,4 +845,87 @@ def momentum_setups(
         "net_pnl": sim.net_pnl,
         "ending_equity": sim.ending_equity,
         "exit_reasons": sim.exit_reasons,
+    }
+
+
+# ---- Phase 4A: market replay (read-only, local snapshots) ----------------
+
+@app.get("/api/research/sessions")
+def replay_sessions():
+    """List available historical SIP snapshots — no filesystem paths exposed."""
+    base = RESEARCH_ROOT / "snapshots"
+    sessions = []
+    seen: set[tuple[str, str]] = set()
+    if not base.is_dir():
+        return {"sessions": []}
+    for sym_dir in sorted(base.iterdir()):
+        if not sym_dir.is_dir():
+            continue
+        for sess_dir in sorted(sym_dir.iterdir()):
+            sip_dir = sess_dir / "sip"
+            d = sip_dir if sip_dir.is_dir() else None
+            if d is None:
+                continue
+            # one row per session — latest version wins (unique key)
+            metas = sorted(
+                (p for p in d.glob("meta_v*.json")
+                 if p.stem[5:].isdigit()),
+                key=lambda p: int(p.stem[5:]))
+            if not metas or (sym_dir.name, sess_dir.name) in seen:
+                continue
+            try:
+                meta = _json.loads(metas[-1].read_text())
+            except Exception:
+                continue
+            seen.add((sym_dir.name, sess_dir.name))
+            sessions.append({
+                "symbol": sym_dir.name,
+                "session": sess_dir.name,
+                "feed": meta.get("feed", "sip"),
+                "version": meta.get("version"),
+                "coverage_pct": meta.get("coverage_pct"),
+                "confidence": meta.get("confidence"),
+                "bars": meta.get("bars"),
+            })
+    return {"sessions": sessions}
+
+
+@app.get("/api/research/replay")
+def replay_bars(symbol: str = Query(..., min_length=1, max_length=10),
+                date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    """Return the immutable SIP snapshot for replay — normalized OHLCV bars."""
+    symbol = symbol.strip().upper()
+    if not symbol.replace(".", "").isalnum():
+        raise HTTPException(status_code=422, detail="Invalid symbol")
+    try:
+        session_date = datetime.fromisoformat(date).date()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid date") from None
+    recs = load_snapshot(symbol, date, feed="sip")
+    if not recs:
+        raise HTTPException(
+            status_code=404,
+            detail="Snapshot unavailable for symbol/date")
+    vs = list_versions(symbol, date, feed="sip")
+    sha = snapshot_hash(symbol, date, vs[-1], feed="sip") if vs else None
+    meta_path = (RESEARCH_ROOT / "snapshots" / symbol / date / "sip"
+                 / f"meta_v{vs[-1]}.json" if vs else None)
+    meta = {}
+    if meta_path and meta_path.exists():
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+    bars = [{"t": r["t"], "o": r["o"], "h": r["h"], "l": r["l"],
+             "c": r["c"], "v": r["v"]} for r in recs]
+    return {
+        "symbol": symbol,
+        "session": date,
+        "feed": "sip",
+        "timezone": "America/New_York",
+        "snapshot_sha256": sha,
+        "coverage_pct": meta.get("coverage_pct"),
+        "confidence": meta.get("confidence"),
+        "note": "historical replay — not live trading",
+        "bars": bars,
     }

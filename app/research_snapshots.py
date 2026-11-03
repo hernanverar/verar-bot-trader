@@ -170,7 +170,7 @@ def load_snapshot(symbol: str, session: str, version: int | None = None,
                   feed: str = "iex") -> list[dict]:
     d = _snap_dir(symbol, session, feed)
     if version is None:
-        vs = list_versions(symbol, session)
+        vs = list_versions(symbol, session, feed)
         if not vs:
             return []
         version = vs[-1]

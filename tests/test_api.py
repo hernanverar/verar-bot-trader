@@ -452,3 +452,24 @@ def test_momentum_setups_fail_closed_no_calendar(monkeypatch):
     assert body["session_verified"] is False
     assert body["confirmed"] == [] and body["bars_analyzed"] == 0
     assert "fail-closed" in body["reason"]
+
+
+def test_replay_sessions_and_bars():
+    res = client.get("/api/research/sessions")
+    assert res.status_code == 200
+    for s in res.json()["sessions"]:
+        assert set(s) >= {"symbol", "session", "feed", "coverage_pct"}
+        assert "/" not in s["session"] and "\\" not in s["session"]
+    if res.json()["sessions"]:
+        s = res.json()["sessions"][0]
+        r2 = client.get(f"/api/research/replay?symbol={s['symbol']}&date={s['session']}")
+        assert r2.status_code == 200
+        body = r2.json()
+        assert body["feed"] == "sip" and body["bars"]
+        assert "not live trading" in body["note"]
+
+
+def test_replay_invalid():
+    assert client.get("/api/research/replay?symbol=%20&date=2026-11-02").status_code == 422
+    assert client.get("/api/research/replay?symbol=ZZZZZ&date=2026-11-02").status_code == 404
+    assert client.get("/api/research/replay?symbol=AMC&date=bad").status_code == 422
