@@ -473,3 +473,23 @@ def test_replay_invalid():
     assert client.get("/api/research/replay?symbol=%20&date=2026-11-02").status_code == 422
     assert client.get("/api/research/replay?symbol=ZZZZZ&date=2026-11-02").status_code == 404
     assert client.get("/api/research/replay?symbol=AMC&date=bad").status_code == 422
+
+
+def test_sessions_meta_version_discovery(tmp_path):
+    """meta_vN files are discovered and numerically sorted (not lexically)."""
+    d = tmp_path / "snapshots" / "X" / "2026-01-15" / "sip"
+    d.mkdir(parents=True)
+    for v in (10, 2, 1):
+        (d / f"v{v}.jsonl").write_text('{"t":"t","o":1,"h":1,"l":1,"c":1,"v":1}\n')
+        (d / f"meta_v{v}.json").write_text(f'{{"feed":"sip","version":{v}}}')
+    metas = sorted((p for p in d.glob("meta_v*.json") if p.stem[6:].isdigit()),
+                   key=lambda p: int(p.stem[6:]))
+    assert [int(p.stem[6:]) for p in metas] == [1, 2, 10]
+
+
+def test_replay_endpoints_live():
+    r = client.get("/api/research/sessions")
+    assert r.status_code == 200 and len(r.json()["sessions"]) > 0
+    s = r.json()["sessions"][0]
+    r2 = client.get(f"/api/research/replay?symbol={s['symbol']}&date={s['session']}")
+    assert r2.status_code == 200 and len(r2.json()["bars"]) > 0

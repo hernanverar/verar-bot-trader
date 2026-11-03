@@ -870,8 +870,8 @@ def replay_sessions():
             # one row per session — latest version wins (unique key)
             metas = sorted(
                 (p for p in d.glob("meta_v*.json")
-                 if p.stem[5:].isdigit()),
-                key=lambda p: int(p.stem[5:]))
+                 if p.stem[6:].isdigit()),
+                key=lambda p: int(p.stem[6:]))
             if not metas or (sym_dir.name, sess_dir.name) in seen:
                 continue
             try:
