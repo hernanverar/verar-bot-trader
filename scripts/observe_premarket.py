@@ -66,7 +66,9 @@ def update_history(history: dict, rows: list, obs_ts: str) -> None:
             "ts": obs_ts, "source": src, "last": r.get("last"),
             "gap_pct": r.get("gap_pct"), "age_s": r.get("age_s"),
             "status": r.get("status"), "rvol": r.get("rvol"),
+            "observed_ts": r.get("observed_ts"),   # market bar ts, not detection
             "qualified": r.get("qualified")})
+        h["first_detected_at"] = h["first_seen"]  # our capture time
 
 
 def summarize(history: dict, records: list[dict]) -> dict:
@@ -94,15 +96,49 @@ def summarize(history: dict, records: list[dict]) -> dict:
         first_src[k] = first_src.get(k, 0) + 1
     later_ma = sum(1 for s, h in history.items()
                    if h["first_source"] == "gap_scan" and "most_actives" in h["sources"])
+    # INVARIANT: prospective metrics count only captures that are
+    # 200 + not missed + inside the live premarket window.
+    q_fresh = q_stale = q_contextual = 0
+    for rec, o in zip(records, obs):
+        prospective = (o["status"] == 200 and not o["missed"]
+                       and o["market"] == "premarket")
+        for r in (rec.get("response") or {}).get("rows") or []:
+            if not r.get("qualified"):
+                continue
+            if not prospective:
+                q_contextual += 1          # historical/contextual only
+            elif r.get("status") == "ok":
+                q_fresh += 1               # genuine prospective discovery
+            else:
+                q_stale += 1               # valid slot but stale obs
+    valid_slots = sum(
+        1 for o in obs
+        if o["status"] == 200 and not o["missed"]
+        and o["market"] == "premarket")
+    missed_slots = sum(1 for o in obs
+                       if o["missed"] or o["error"] or o["status"] != 200)
+    if valid_slots == len(records):
+        validity = "valid"
+    elif valid_slots > 0:
+        validity = "partial"
+    else:
+        validity = "not_validated"
     return {
         "observations": obs,
+        "session_validity": validity,
+        "valid_observation_slots": valid_slots,
+        "missed_observation_slots": missed_slots,
         "unique_symbols": len(history),
         "qualified_symbols": sorted(qualified_syms),
-        "qualified_count": len(qualified_syms),
+        "qualified_total": len(qualified_syms),
+        "qualified_fresh": q_fresh,
+        "qualified_stale": q_stale,
+        "qualified_contextual": q_contextual,
         "first_source_counts": first_src,
         "gap_scan_later_in_most_actives": later_ma,
         "errors": [o for o in obs if o["error"] or (o["status"] not in (200, None))],
-        "note": "single-session observation — not predictive performance",
+        "note": "single-session observation — not predictive performance; "
+                "qualified_stale are historical/contextual, never prospective",
     }
 
 
@@ -150,9 +186,13 @@ def main() -> None:
 
     summary = summarize(history, records)
     sum_path.write_text(json.dumps(summary, indent=1))
-    print(f"\nSUMMARY: {summary['unique_symbols']} syms, "
-          f"{summary['qualified_count']} qualified "
-          f"({', '.join(summary['qualified_symbols'][:8])})")
+    print(f"\nSUMMARY ({summary['session_validity']}): "
+          f"{summary['unique_symbols']} syms, "
+          f"qualified fresh={summary['qualified_fresh']} "
+          f"stale={summary['qualified_stale']} "
+          f"contextual={summary['qualified_contextual']} "
+          f"| slots valid={summary['valid_observation_slots']} "
+          f"missed={summary['missed_observation_slots']}")
     print(f"first_source: {summary['first_source_counts']} | "
           f"gap_scan->most_actives later: {summary['gap_scan_later_in_most_actives']}")
     print(f"saved: {sum_path.name} + {len(records)} raw captures")
