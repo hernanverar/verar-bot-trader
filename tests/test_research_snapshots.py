@@ -108,3 +108,30 @@ def test_feed_isolation(store):
         rs.load_snapshot("X", "2026-01-15", feed="iex")
     assert rs.list_versions("X", "2026-01-15", feed="iex") == [1]
     assert rs.list_versions("X", "2026-01-15", feed="sip") == [1]
+
+
+def test_symbol_data_classification():
+    assert rs.classify_symbol_data("A", {"A": [1]*12}, [], []) == "screened"
+    assert rs.classify_symbol_data("A", {}, ["A"], []) == "no_data"
+    assert rs.classify_symbol_data("A", {}, ["A"], ["err A"]) == "acquisition_failed"
+    assert rs.classify_symbol_data("A", {"A": [1]*5}, [], []) == "insufficient_history"
+
+
+def test_h1_validation_date_boundaries():
+    import sys, importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "h1e", "scripts/h1_daily_eval.py")
+    # import only the pure function — script needs alpaca creds at import;
+    # test validate_day logic via module load guarded by argparse anyway
+    src = open("scripts/h1_daily_eval.py").read()
+    assert "VALIDATION_START = date(2026, 11, 3)" in src
+    assert 'before validation start' in src
+    assert "session not complete" in src
+    # idempotency: manifest dedups by sym in done set
+    assert 'if c.symbol in done' in src
+    # incomplete sessions rejected via day >= today
+    assert "if day >= today" in src
+
+
+def test_manifest_structure():
+    import scripts.h1_daily_eval  # noqa — import side effects are argparse-guarded

@@ -49,26 +49,67 @@ def git_commit() -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default=",".join(DEFAULT_UNIVERSE))
+    ap.add_argument("--universe", default="watchlist",
+                    choices=["watchlist", "assets"],
+                    help="symbol source: curated list or full asset universe")
+    ap.add_argument("--pilot", type=int, default=0,
+                    help="limit universe to first N symbols (integrity test)")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--acquire", action="store_true",
                     help="fetch minute bars and write snapshots")
     ap.add_argument("--feed", default="iex", choices=["iex", "sip"],
                     help="bar feed (sip = consolidated, delayed ~15min)")
     args = ap.parse_args()
-    universe = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     now = datetime.now(timezone.utc)
     dc, tc = get_data_client(), get_trading_client()
 
+    if args.universe == "assets":
+        from app.asset_universe import (
+            fetch_asset_universe, save_manifest, chunked)
+        syms, manifest = fetch_asset_universe()
+        print(f"universe: {manifest.eligible} eligible of "
+              f"{manifest.total_assets} assets | excluded={manifest.excluded}")
+        save_manifest(manifest, syms)
+        universe = syms[: args.pilot] if args.pilot else syms
+    else:
+        universe = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    print(f"screening {len(universe)} symbols")
+
     # ---- daily screening (post-session; never intraday claims) ----
-    req = StockBarsRequest(symbol_or_symbols=universe, timeframe=TimeFrame.Day,
-                           start=now - timedelta(days=args.days + 15), end=now,
-                           feed="iex")
-    daily = dc.get_stock_bars(req).data
-    print(f"screened {len(daily)} symbols / {args.days}+15d")
+    daily = {}
+    req_stats = {"requests": 0, "missing_symbols": [], "failures": []}
+    from app.asset_universe import chunked as _chunks
+    for chunk in _chunks(universe, 120):
+        try:
+            req = StockBarsRequest(symbol_or_symbols=chunk,
+                                   timeframe=TimeFrame.Day,
+                                   start=now - timedelta(days=args.days + 15),
+                                   # delayed SIP: end must be <= now-15min
+                                   end=now - timedelta(minutes=20),
+                                   feed="sip")
+            res = dc.get_stock_bars(req)
+            req_stats["requests"] += 1
+            daily.update(res.data)
+            req_stats["missing_symbols"].extend(
+                s_ for s_ in chunk if s_ not in res.data)
+        except Exception as exc:
+            req_stats["failures"].append(str(exc)[:120])
+            req_stats["missing_symbols"].extend(chunk)
+    print(f"screened {len(daily)} symbols / {args.days}+15d | "
+          f"requests={req_stats['requests']} missing={len(req_stats['missing_symbols'])} "
+          f"failures={len(req_stats['failures'])}")
     cfg = ResearchScreenConfig()
     cands = screen_daily_bars(daily, cfg)
     qual = [c for c in cands if c.tier != "nonqualifier"]
     save_screening(now.date().isoformat(), cands, cfg)
+    from app.research_snapshots import classify_symbol_data
+    classes = {}
+    for s_ in universe:
+        cls = classify_symbol_data(
+            s_, daily, req_stats["missing_symbols"],
+            req_stats["failures"], cfg.min_history)
+        classes[cls] = classes.get(cls, 0) + 1
+    print(f"symbol classes: {classes}")
     print(f"candidates: {len(cands)} | qualifying: {len(qual)}")
     for c in qual:
         print(f"  {c.tier:24s} {c.symbol:6s} {c.session_date} "

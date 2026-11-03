@@ -239,3 +239,18 @@ def save_screening(name: str, candidates: list[ScreenedCandidate],
     with _LOCK:
         _atomic_write(path, json.dumps(body, indent=2))
     return path
+
+
+def classify_symbol_data(
+    symbol: str, daily: dict, missing: list[str], failures: list[str],
+    min_history: int = 10,
+) -> str:
+    """Symbol-level screening outcome — never confuse missing data with
+    a validly-screened nonqualifier."""
+    if symbol in missing and any(symbol in f for f in failures):
+        return "acquisition_failed"
+    if symbol not in daily:
+        return "no_data"
+    if len(daily[symbol]) < min_history:
+        return "insufficient_history"
+    return "screened"

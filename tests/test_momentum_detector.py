@@ -369,3 +369,36 @@ def test_contiguous_entry_same_rth_session():
     assert r.trades == () and r.unresolved == ()
     assert len(r.skipped) == 1
     assert "gap" in r.skipped[0][1] or "no next" in r.skipped[0][1]
+
+
+def test_h1_hold_success_and_failure():
+    from app.strategies.hold_confirmation import evaluate_h1
+    bars = impulse_bars() + [
+        bar(4, 2.12, 2.13, 2.07, 2.08, v=500),       # pullback low 2.07
+        bar(5, 2.08, 2.16, 2.07, 2.15, v=1200),      # confirm N, imp_high 2.13
+        bar(6, 2.15, 2.18, 2.13, 2.17, v=900),       # N+1 low 2.13 >= 2.13 holds
+        bar(7, 2.17, 2.25, 2.16, 2.22, v=800),       # N+2 entry at open 2.17
+        bar(8, 2.22, 2.30, 2.20, 2.28, v=700),
+    ]
+    setups, _ = detect_momentum_setups(bars, CFG, "X")
+    sim, out = evaluate_h1(bars, setups, SIM_CFG)
+    assert out[setups[0].confirm_ts] == "evaluated"
+    t = sim.unresolved[0]
+    assert t.entry_ts == bars[7].timestamp and t.entry_price == 2.17
+    assert t.stop_price == 2.07                       # original structural stop
+    # fail variant: N+1 low dips below impulse high
+    bars2 = bars[:6] + [bar(6, 2.10, 2.12, 2.05, 2.08, v=900)] + bars[7:]
+    setups2, _ = detect_momentum_setups(bars2, CFG, "X")
+    _, out2 = evaluate_h1(bars2, setups2, SIM_CFG)
+    assert out2[setups2[0].confirm_ts] == "hold_failed"
+
+
+def test_h1_missing_n1_and_gap():
+    from app.strategies.hold_confirmation import evaluate_h1
+    bars = impulse_bars() + [
+        bar(4, 2.12, 2.13, 2.07, 2.08, v=500),
+        bar(5, 2.08, 2.16, 2.07, 2.15, v=1200),      # last bar = confirm
+    ]
+    setups, _ = detect_momentum_setups(bars, CFG, "X")
+    _, out = evaluate_h1(bars, setups, SIM_CFG)
+    assert out[setups[0].confirm_ts] == "hold_missing_n1"
