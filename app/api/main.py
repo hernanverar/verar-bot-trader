@@ -1015,7 +1015,7 @@ def premarket_scanner(
                         break
             st["scanned"] = len(snaps)
             found = gap_scan(snaps, cfg, discover_gap_pct=discover_gap,
-                             valid_after=pm_bounds(today)[0])
+                             window=pm_bounds(today))
             st["candidates"] = len(found)
             return {"stats": st, "found": found}
         try:
@@ -1033,7 +1033,9 @@ def premarket_scanner(
                     seen.add(f_["symbol"])
         except Exception as exc:
             disc_err["gap_scan"] = str(exc)[:120]
-    results = {"market": "premarket", "feed": "iex", "checked_at": now.isoformat(),
+    market_label = ("premarket" if in_pm
+                    else "premarket_ended" if pm_done else "premarket_pending")
+    results = {"market": market_label, "feed": "iex", "checked_at": now.isoformat(),
                "in_window": in_pm, "discovery_errors": disc_err,
                "scan": scan_stats,
                "notes": ["volumes/RVOL are IEX-partial, not consolidated",

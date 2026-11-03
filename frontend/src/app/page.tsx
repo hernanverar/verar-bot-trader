@@ -543,8 +543,14 @@ export default function Home() {
           <div className="mb-4 flex items-center justify-between">
             <h3 className="text-lg font-semibold">Premarket Momentum — IEX Partial</h3>
           </div>
+          {pmMeta?.market === "premarket_pending" && (
+            <p className="text-sm text-slate-400">Premarket has not started.</p>)}
+          {pmMeta?.market === "premarket" && (
+            <p className="text-xs text-amber-300">Premarket monitoring — IEX partial data.</p>)}
+          {pmMeta?.market === "premarket_ended" && (
+            <p className="text-sm text-slate-400">Premarket session ended — observations below are historical, not live.</p>)}
           {pmMeta?.market === "premarket_not_active" && (
-            <p className="text-sm text-slate-400">Outside the 04:00–09:29 ET premarket window — monitoring resumes next session.</p>)}
+            <p className="text-sm text-slate-400">Outside the 04:00–09:29 ET premarket window or non-trading day.</p>)}
           {pmMeta?.scan && pmMeta.scan.requests > 0 && (
             <p className="mb-3 text-xs text-slate-400">
               Broad scan: {pmMeta.scan.scanned} scanned · {pmMeta.scan.candidates} candidates

@@ -139,7 +139,7 @@ def test_gap_scan_rejects_stale_trades():
         "BADTS": {"latestTrade": {"p": 3.0, "t": "garbage"},
                   "prevDailyBar": {"c": 2.0}},
     }
-    rows = gap_scan(snaps, PremarketCfg(), valid_after=pm_open)
+    rows = gap_scan(snaps, PremarketCfg(), window=pm_bounds(DAY))
     assert [r["symbol"] for r in rows] == ["FRESH"]
     # without a window, OLD would pass -> validates the guard exists
     assert len(gap_scan(snaps, PremarketCfg())) == 3
@@ -183,3 +183,20 @@ def test_cache_key_invalidates_and_failure_recovers():
     try: cached_gap_scan(boom, key="k")
     except RuntimeError: pass
     assert cached_gap_scan(fetch, key="k")["result"] == {"found": []}
+
+
+def test_gap_scan_window_boundaries():
+    from app.premarket_scanner import gap_scan
+    win = pm_bounds(DAY)  # [04:00, 09:30) ET
+    def snap(t): return {"latestTrade": {"p": 3.0, "t": t},
+                         "prevDailyBar": {"c": 2.0}}
+    snaps = {
+        "T0400": snap("2026-11-03T09:00:00Z"),   # 04:00 ET inclusive
+        "T0929": snap("2026-11-03T14:29:00Z"),   # 09:29 ET accepted
+        "T0930": snap("2026-11-03T14:30:00Z"),   # 09:30 ET rejected
+        "RTH":   snap("2026-11-03T16:00:00Z"),   # regular session
+        "PMKT":  snap("2026-11-03T21:00:00Z"),   # postmarket
+        "OLD":   snap("2026-11-02T20:00:00Z"),   # previous day
+    }
+    rows = gap_scan(snaps, PremarketCfg(), window=win)
+    assert sorted(r["symbol"] for r in rows) == ["T0400", "T0929"]

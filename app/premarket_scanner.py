@@ -161,22 +161,22 @@ def baseline_volumes(daily_pm: dict[str, list], sessions: list[date],
 
 def gap_scan(snaps: dict, cfg: PremarketCfg,
              discover_gap_pct: float = 5.0,
-             valid_after: datetime | None = None) -> list[dict]:
+             window: tuple[datetime, datetime] | None = None) -> list[dict]:
     """Stage-1 discovery from bulk snapshots (latestTrade + prevDailyBar).
     Cheap: price+gap per symbol with zero extra requests.
-    `valid_after` (tz-aware): only trades at/after this instant count as
-    current-session observations — a stale latestTrade never manufactures
-    a premarket gap."""
+    `window` (tz-aware [start, end)): only trades inside the actual
+    premarket interval count — regular-session/postmarket trades never
+    manufacture a premarket gap."""
     out = []
     for sym, s in snaps.items():
         lt, pdb = (s or {}).get("latestTrade") or {}, (s or {}).get("prevDailyBar") or {}
         px, pc, ts = lt.get("p"), pdb.get("c"), lt.get("t")
         if not px or not pc or not ts:
             continue
-        if valid_after is not None:
+        if window is not None:
             try:
-                tt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                if tt < valid_after:
+                tt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ET)
+                if not (window[0] <= tt < window[1]):
                     continue
             except (ValueError, TypeError):
                 continue
